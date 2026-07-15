@@ -1,24 +1,15 @@
 """
-src/inventory/manager.py
-─────────────────────────
-Collateral balancer and multi-market exposure manager.
+Collateral and multi-market exposure tracking.
 
-Responsibilities:
-  1. Track real USDC/USD collateral across venues (Polymarket escrow + Kalshi margin)
-  2. Compute per-market exposure in USD-equivalent delta terms
-  3. Enforce position concentration limits (no single market > X% of capital)
-  4. VWAP-based cost tracking for accurate PnL attribution
-  5. Rebalancing signals when collateral allocation drifts from target
+Tracks USDC/USD collateral across venues, computes per-market exposure,
+enforces concentration limits, and keeps VWAP cost basis for PnL.
 
-COLLATERAL MODEL (Polymarket):
-  - BUY YES: locks USDC collateral immediately (makerAmount)
-  - SELL YES: locks outcome tokens (already owned)
-  - Fill: USDC transferred on-chain, outcome tokens returned
-  - Resolution: USDC returned at $1.00 (YES) or $0.00 (NO)
+Polymarket: BUY locks USDC (makerAmount) immediately, SELL locks the
+outcome tokens you already hold. On resolution, USDC comes back at $1
+(YES) or $0 (NO).
 
-COLLATERAL MODEL (Kalshi):
-  - Margin-based: collateral = max(risk per side)
-  - For binary: margin = price × size (BUY) or (1-price) × size (SELL)
+Kalshi is margin-based: margin = price * size on a BUY, (1-price) * size
+on a SELL.
 """
 from __future__ import annotations
 
@@ -34,10 +25,7 @@ from config.settings import RiskProfile
 logger = structlog.get_logger(__name__)
 
 
-# ──────────────────────────────────────────────
 # Types
-# ──────────────────────────────────────────────
-
 @dataclass
 class Position:
     """Live position in one prediction market."""
@@ -115,10 +103,7 @@ class ExposureReport:
     rebalance_signals: List[str]        # human-readable rebalance actions
 
 
-# ──────────────────────────────────────────────
 # Fill Processor
-# ──────────────────────────────────────────────
-
 class FillProcessor:
     """
     VWAP-correct position update from fills.
@@ -188,10 +173,7 @@ class FillProcessor:
         return realized
 
 
-# ──────────────────────────────────────────────
 # Inventory Manager
-# ──────────────────────────────────────────────
-
 class InventoryManager:
     """
     Central inventory and collateral state manager.
@@ -212,8 +194,7 @@ class InventoryManager:
         self._fill_proc = FillProcessor()
         self._log = logger.bind(component="inventory")
 
-    # ── Setup ─────────────────────────────────
-
+    # Setup
     def register_market(self, market_id: str, venue: str) -> None:
         if market_id not in self._positions:
             self._positions[market_id] = Position(market_id=market_id, venue=venue)
@@ -231,8 +212,7 @@ class InventoryManager:
             total_balance=balance,
         )
 
-    # ── State updates ─────────────────────────
-
+    # State updates
     def on_fill(
         self,
         market_id: str,
@@ -346,8 +326,7 @@ class InventoryManager:
 
         return final_pnl
 
-    # ── Query ─────────────────────────────────
-
+    # Query
     def get_net_qty(self, market_id: str) -> float:
         return self._positions.get(market_id, Position("", "")).net_qty
 
@@ -382,8 +361,7 @@ class InventoryManager:
             rebalance_signals=signals,
         )
 
-    # ── Internal ──────────────────────────────
-
+    # Internal
     def _get_position(self, market_id: str) -> Position:
         if market_id not in self._positions:
             self._positions[market_id] = Position(market_id=market_id, venue="unknown")
