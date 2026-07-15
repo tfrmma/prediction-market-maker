@@ -1,20 +1,9 @@
 """
-src/main.py
-────────────
-Main async orchestrator.  Wires all layers together.
+Orchestrator. Wires the feeds, book registry, pricing engine, order
+manager, hedge engine and risk engine together and runs the strategy loop.
 
-Task graph:
-  [PolymarketFeed] ─┐
-                     ├→ [BookRegistry] → state_queue → [Strategy Loop]
-  [KalshiFeed]     ─┘                                       │
-                                                      [FairValueEngine]
-                                                             │
-                                                      [OrderManager] ──→ [Polymarket CLOB]
-                                                             │
-                                                      [HedgeEngine]  ──→ [Hyperliquid]
-                                                             │
-  [RiskEngine] ←─────────────────────────────────────────────┘
-  (independent, owns kill_event)
+RiskEngine runs independently and owns kill_event; everything else checks
+it before acting.
 """
 from __future__ import annotations
 
@@ -28,23 +17,25 @@ import aiohttp
 import structlog
 import uvloop
 
-from config.settings import Settings, get_settings, BookSource, Venue
-from src.data.polymarket_feed import PolymarketFeed, PolyMarket
+from config.settings import Settings, get_settings, Venue
+from src.data.polymarket_feed import (
+    PolymarketFeed, PolyMarket, PolymarketUserFeed, PolyOwnFill,
+)
 from src.data.kalshi_feed import KalshiFeed
-from src.data.unified_book import BookRegistry, MarketState
+from src.data.unified_book import BookRegistry, MarketState, BookSource
 from src.pricing.fair_value import FairValueEngine, ASBinaryParams, ParameterCalibrator
 from src.execution.eip712_signer import EIP712Signer
 from src.execution.order_manager import OrderManager, FlickeringFilter
+from src.execution.polymarket_auth import PolyL2Auth, PolyL2Credentials
 from src.hedging.delta_hedge import HedgeEngine
 from src.risk.engine import RiskEngine
+from src.inventory.manager import InventoryManager
 
 logger = structlog.get_logger(__name__)
 
 
 class Orchestrator:
-    """
-    Lifecycle manager for the full market making stack.
-    """
+    """Owns the lifecycle of the whole market making stack."""
 
     STRATEGY_LOOP_INTERVAL_S: float = 0.1   # 100ms quoting cycle
     CALIBRATION_INTERVAL_S: float  = 300.0  # re-calibrate params every 5 min
@@ -54,10 +45,10 @@ class Orchestrator:
         self._kill_event  = asyncio.Event()
         self._state_queue: asyncio.Queue[MarketState] = asyncio.Queue(maxsize=1000)
         self._feed_queue:  asyncio.Queue = asyncio.Queue(maxsize=5000)
+        self._fill_queue:  asyncio.Queue = asyncio.Queue(maxsize=1000)
         self._health_queue: asyncio.Queue = asyncio.Queue(maxsize=500)
 
         # Per-market state
-        self._inventory: Dict[str, float] = {}      # market_id → net contracts
         self._last_mid:  Dict[str, float] = {}
         self._params:    Dict[str, ASBinaryParams] = {}
         self._calibrators: Dict[str, ParameterCalibrator] = {}
@@ -69,6 +60,8 @@ class Orchestrator:
         self._order_manager: OrderManager = None
         self._hedge_engine:  HedgeEngine = None
         self._signer:        EIP712Signer = None
+        # single source of truth for position/collateral
+        self._inventory_mgr: InventoryManager = None
 
     async def run(self) -> None:
         """Start all subsystems and run until kill signal."""
@@ -91,8 +84,7 @@ class Orchestrator:
         finally:
             await self._shutdown_all(tasks)
 
-    # ── Setup ─────────────────────────────────
-
+    # Setup
     async def _setup(self) -> None:
         poly_creds = self._cfg.polymarket
         hl_creds   = self._cfg.hyperliquid
@@ -104,8 +96,17 @@ class Orchestrator:
         # Shared HTTP session
         self._http_session = aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(limit=50, ssl=True),
-            headers={"Content-Type": "application/json"},
         )
+
+        # without this OrderManager's requests go out unauthenticated and 401
+        l2_auth = None
+        if poly_creds and self._signer is not None:
+            l2_auth = PolyL2Auth(PolyL2Credentials(
+                api_key=poly_creds.api_key,
+                secret=poly_creds.api_secret,
+                passphrase=poly_creds.api_passphrase,
+                address=self._signer.address,
+            ))
 
         # Order manager
         self._order_manager = OrderManager(
@@ -114,7 +115,17 @@ class Orchestrator:
             risk_profile=next(iter(self._cfg.markets.values())).risk,
             rest_url=self._cfg.poly_rest_url,
             flickering_filter=FlickeringFilter(),
+            l2_auth=l2_auth,
         )
+
+        # inventory manager: position size, VWAP cost basis, realized PnL
+        self._inventory_mgr = InventoryManager(
+            risk_profile=next(iter(self._cfg.markets.values())).risk,
+        )
+        if poly_creds:
+            self._inventory_mgr.register_account("polymarket", "pUSD", balance=0.0)
+        if self._cfg.kalshi:
+            self._inventory_mgr.register_account("kalshi", "USD", balance=0.0)
 
         # Book registry
         self._book_registry = BookRegistry(self._state_queue)
@@ -123,7 +134,7 @@ class Orchestrator:
                       if mconf.venue == Venue.POLYMARKET
                       else BookSource.KALSHI)
             self._book_registry.register(mid, source, mconf.resolution_ts)
-            self._inventory[mid] = 0.0
+            self._inventory_mgr.register_market(mid, mconf.venue.value)
             self._last_mid[mid]  = 0.0
             self._params[mid]    = ASBinaryParams()
             self._calibrators[mid] = ParameterCalibrator(ASBinaryParams())
@@ -145,8 +156,7 @@ class Orchestrator:
             for mid in self._cfg.markets:
                 self._hedge_engine.register_market(mid)
 
-    # ── Feed runner ───────────────────────────
-
+    # Feed runner
     async def _run_feeds(self) -> None:
         """Launch WebSocket feeds and route events to BookRegistry."""
         tasks = []
@@ -168,13 +178,24 @@ class Orchestrator:
             feed = PolymarketFeed(
                 ws_url=self._cfg.poly_ws_url,
                 markets=poly_markets,
-                api_key=self._cfg.polymarket.api_key,
-                api_secret=self._cfg.polymarket.api_secret,
-                api_passphrase=self._cfg.polymarket.api_passphrase,
                 out_queue=self._feed_queue,
                 health_queue=self._health_queue,
             )
             tasks.append(asyncio.create_task(feed.run(), name="poly_feed"))
+
+            # user channel: our own fills. without this the bot never learns
+            # about its own fills and inventory just sits at zero forever
+            user_feed = PolymarketUserFeed(
+                ws_url=self._cfg.poly_ws_url.replace("/ws/market", "/ws/user"),
+                condition_ids=[m.condition_id for m in poly_markets_cfg],
+                api_key=self._cfg.polymarket.api_key,
+                api_secret=self._cfg.polymarket.api_secret,
+                api_passphrase=self._cfg.polymarket.api_passphrase,
+                out_queue=self._fill_queue,
+                health_queue=self._health_queue,
+            )
+            tasks.append(asyncio.create_task(user_feed.run(), name="poly_user_feed"))
+            tasks.append(asyncio.create_task(self._fill_dispatch(), name="fill_dispatch"))
 
         # Kalshi feed
         kalshi_cfg = [
@@ -209,13 +230,59 @@ class Orchestrator:
         tasks.append(asyncio.create_task(dispatch(), name="dispatch"))
         await asyncio.gather(*tasks)
 
-    # ── Strategy loop ─────────────────────────
+    # Fill dispatch
+    async def _fill_dispatch(self) -> None:
+        """Own-fill events -> OrderManager, InventoryManager (source of
+        truth for position/PnL), and RiskEngine's kill-switch tracking."""
+        while not self._kill_event.is_set():
+            try:
+                ev = await asyncio.wait_for(self._fill_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
 
+            if not isinstance(ev, PolyOwnFill):
+                continue
+
+            market_id = ev.condition_id
+            mconf = self._cfg.markets.get(market_id)
+            if mconf is None:
+                continue
+
+            self._order_manager.mark_filled(ev.order_id, ev.size)
+
+            collateral_used = ev.price * ev.size if ev.side == "BUY" else (1 - ev.price) * ev.size
+            realized = self._inventory_mgr.on_fill(
+                market_id=market_id,
+                fill_side=ev.side,
+                fill_price=ev.price,
+                fill_qty=ev.size,
+                collateral_used=collateral_used,
+            )
+
+            mid_at_fill = self._last_mid.get(market_id, ev.price)
+            self._risk_engine.on_fill(
+                market_id=market_id,
+                order_id=ev.order_id,
+                fill_price=ev.price,
+                fill_size=ev.size,
+                side=ev.side,
+                mid_at_fill=mid_at_fill,
+                realized_pnl=realized,
+            )
+
+            logger.info(
+                "fill_dispatched",
+                market_id=market_id,
+                side=ev.side,
+                price=round(ev.price, 4),
+                size=ev.size,
+                realized_pnl=round(realized, 4),
+                net_qty=round(self._inventory_mgr.get_net_qty(market_id), 2),
+            )
+
+    # Strategy loop
     async def _strategy_loop(self) -> None:
-        """
-        Main quoting loop.
-        Drains state_queue and updates quotes for each market.
-        """
+        """Main quoting loop, drains state_queue and updates quotes per market."""
         while not self._kill_event.is_set():
             try:
                 state: MarketState = await asyncio.wait_for(
@@ -232,8 +299,9 @@ class Orchestrator:
             if mconf is None:
                 continue
 
-            # Update risk engine mark
+            # Update risk engine mark + inventory mark-to-market
             self._risk_engine.on_market_update(mid_id, state.p_mid)
+            self._inventory_mgr.update_mid(mid_id, state.p_mid)
 
             # Flow delta for calibration
             prev_mid = self._last_mid.get(mid_id, state.p_mid)
@@ -250,7 +318,7 @@ class Orchestrator:
             apply_bias = (mconf.venue == Venue.KALSHI)
             fv = self._pricing_engine.compute(
                 state=state,
-                inventory_q=self._inventory.get(mid_id, 0.0),
+                inventory_q=self._inventory_mgr.get_net_qty(mid_id),
                 params=params,
                 apply_bias_correction=apply_bias,
             )
@@ -275,8 +343,9 @@ class Orchestrator:
                     state=state,
                     fv=fv,
                     yes_token_id=yes_token_id,
-                    inventory_q=self._inventory.get(mid_id, 0.0),
+                    inventory_q=self._inventory_mgr.get_net_qty(mid_id),
                     order_size_usd=mconf.risk.min_edge_bps * 10,  # size proportional to edge
+                    neg_risk=mconf.neg_risk,
                 )
 
             # Trigger hedge if needed
@@ -287,7 +356,7 @@ class Orchestrator:
 
                 instr = await self._hedge_engine.compute_and_hedge(
                     market_id=mid_id,
-                    inventory_q=self._inventory.get(mid_id, 0.0),
+                    inventory_q=self._inventory_mgr.get_net_qty(mid_id),
                     p_mid=state.p_mid,
                     S_perp=S_perp,
                     K_strike=K_strike,
@@ -300,8 +369,7 @@ class Orchestrator:
                         self._http_session, instr, S_perp
                     )
 
-    # ── Calibration loop ──────────────────────
-
+    # Calibration loop
     async def _calibration_loop(self) -> None:
         while not self._kill_event.is_set():
             await asyncio.sleep(self.CALIBRATION_INTERVAL_S)
@@ -316,8 +384,7 @@ class Orchestrator:
                     gamma=round(updated.gamma, 5),
                 )
 
-    # ── Kill monitor ──────────────────────────
-
+    # Kill monitor
     async def _monitor_kill(self) -> None:
         await self._kill_event.wait()
         logger.critical(
@@ -331,8 +398,7 @@ class Orchestrator:
             except Exception:
                 pass
 
-    # ── Shutdown ──────────────────────────────
-
+    # Shutdown
     async def _shutdown_all(self, tasks) -> None:
         for t in tasks:
             t.cancel()
@@ -342,10 +408,7 @@ class Orchestrator:
         logger.info("orchestrator_clean_shutdown")
 
 
-# ──────────────────────────────────────────────
 # Entrypoint
-# ──────────────────────────────────────────────
-
 async def main() -> None:
     structlog.configure(
         processors=[
