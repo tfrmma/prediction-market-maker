@@ -1,24 +1,16 @@
 """
-src/execution/order_manager.py
-───────────────────────────────
-Execution controller for prediction market orders.
+Execution controller. Tracks open orders per market, decides when to
+cancel/replace based on FairValueResult changes, filters out flickering
+(sub-500ms cancel spam), enforces post-only, self-trade prevention.
 
-Responsibilities:
-  1. Maintains the live order book state (open orders per market)
-  2. Executes cancel/replace logic based on FairValueResult changes
-  3. Implements Flickering Filter: detects sub-500ms institutional cancel patterns
-  4. Post-Only enforcement (maker-only orders)
-  5. Self-trade prevention
-  6. Async submission via REST with retry and timeout handling
-
-Cancel/Replace Policy:
-  - Reprice if |current_quote - new_quote| > min_edge_bps / 2
-  - Always cancel if state.is_stale or RiskEngine signals kill
-  - Don't reprice within 50ms of last placement (anti-latency-arbitrage)
+Reprice if |current_quote - new_quote| > min_edge_bps / 2. Always cancel
+on state.is_stale or a kill signal from RiskEngine. Won't reprice within
+50ms of the last placement, mostly to avoid chasing our own tail.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -31,15 +23,13 @@ import structlog
 from config.settings import RiskProfile
 from src.data.unified_book import MarketState
 from src.execution.eip712_signer import EIP712Signer, OrderParams, OrderSide, SignedOrder
+from src.execution.polymarket_auth import PolyL2Auth
 from src.pricing.fair_value import FairValueResult
 
 logger = structlog.get_logger(__name__)
 
 
-# ──────────────────────────────────────────────
 # Types
-# ──────────────────────────────────────────────
-
 class OrderStatus(str, Enum):
     PENDING      = "pending"      # sent, awaiting ack
     OPEN         = "open"         # on book
@@ -69,10 +59,7 @@ class ManagedOrder:
     last_update_ts: float = field(default_factory=time.monotonic)
 
 
-# ──────────────────────────────────────────────
 # Flickering Filter
-# ──────────────────────────────────────────────
-
 class FlickeringFilter:
     """
     Detects institutional order flickering (rapid cancel-replace cycles
@@ -125,18 +112,10 @@ class FlickeringFilter:
         self._frozen[market_id][side] = 0.0
 
 
-# ──────────────────────────────────────────────
 # Order Manager
-# ──────────────────────────────────────────────
-
 class OrderManager:
-    """
-    Async order lifecycle manager for Polymarket CLOB.
-
-    Usage:
-        mgr = OrderManager(session, signer, risk_profile, rest_url)
-        await mgr.update_quotes(state, fv_result, inventory_q)
-    """
+    """Owns the order lifecycle for the Polymarket CLOB, cancel/replace,
+    flickering suppression, fill bookkeeping."""
 
     # Minimum time between cancel-and-replace to suppress latency arb
     MIN_REPRICE_INTERVAL_S: float = 0.050   # 50ms
@@ -150,11 +129,13 @@ class OrderManager:
         risk_profile: RiskProfile,
         rest_url: str,
         flickering_filter: Optional[FlickeringFilter] = None,
+        l2_auth: Optional[PolyL2Auth] = None,
     ):
         self._session   = http_session
         self._signer    = signer
         self._risk      = risk_profile
         self._rest_url  = rest_url.rstrip("/")
+        self._l2_auth   = l2_auth   # None => requests go out unauthenticated (will 401 for real trading)
         self._flicker   = flickering_filter or FlickeringFilter(
             window_ms=risk_profile.flickering_window_ms,
             cancel_threshold=risk_profile.flickering_cancel_threshold,
@@ -168,8 +149,7 @@ class OrderManager:
 
         self._log = logger.bind(component="order_manager")
 
-    # ── Main entry point ──────────────────────
-
+    # Main entry point
     async def update_quotes(
         self,
         state: MarketState,
@@ -177,6 +157,7 @@ class OrderManager:
         yes_token_id: str,
         inventory_q: float,
         order_size_usd: float = 50.0,
+        neg_risk: bool = False,
     ) -> None:
         """
         Compare current live quotes against FairValueResult.
@@ -184,7 +165,7 @@ class OrderManager:
         """
         market_id = state.market_id
 
-        # ── Safety checks ─────────────────────
+        # Safety checks
         if not fv.should_quote:
             await self._cancel_all(market_id, reason="should_not_quote")
             return
@@ -194,7 +175,7 @@ class OrderManager:
             await self._handle_max_inventory(market_id, inventory_q)
             return
 
-        # ── Process each side ─────────────────
+        # Process each side
         for side_str, quote_price in [
             ("BUY",  fv.bid_quote),
             ("SELL", fv.ask_quote),
@@ -225,6 +206,7 @@ class OrderManager:
                 fv=fv,
                 yes_token_id=yes_token_id,
                 order_size_usd=order_size_usd,
+                neg_risk=neg_risk,
             )
 
     async def _update_side(
@@ -235,18 +217,19 @@ class OrderManager:
         fv: FairValueResult,
         yes_token_id: str,
         order_size_usd: float,
+        neg_risk: bool = False,
     ) -> None:
         key = (market_id, side_str)
         live = self._live.get(key)
 
         if live is None or live.status not in (OrderStatus.OPEN, OrderStatus.PENDING):
-            # No live order — place new
+            # No live order , place new
             await self._place_order(
                 market_id, side_str, quote_price, yes_token_id, order_size_usd
             )
             return
 
-        # Order exists — check if reprice is warranted
+        # Order exists , check if reprice is warranted
         age_s = time.monotonic() - live.placed_ts
         if age_s < self.MIN_REPRICE_INTERVAL_S:
             return   # Too soon to reprice
@@ -268,10 +251,16 @@ class OrderManager:
         cancelled = await self._cancel_order(live)
         if cancelled:
             await self._place_order(
-                market_id, side_str, quote_price, yes_token_id, order_size_usd
+                market_id, side_str, quote_price, yes_token_id, order_size_usd,
+                neg_risk=neg_risk,
             )
 
-    # ── Order operations ──────────────────────
+    # Order operations
+    def _auth_headers(self, method: str, path: str, body: str = "") -> dict:
+        """L2 HMAC auth headers, or {} if no credentials configured (dev/backtest)."""
+        if self._l2_auth is None:
+            return {}
+        return self._l2_auth.headers(method, path, body)
 
     async def _place_order(
         self,
@@ -280,6 +269,7 @@ class OrderManager:
         price: float,
         token_id: str,
         size_usd: float,
+        neg_risk: bool = False,
     ) -> Optional[ManagedOrder]:
         """
         Build, sign, and submit a POST-ONLY limit order.
@@ -294,6 +284,7 @@ class OrderManager:
             side=side,
             price=price,
             size=n_contracts,
+            neg_risk=neg_risk,
         )
 
         try:
@@ -303,13 +294,16 @@ class OrderManager:
             return None
 
         payload = signed.to_api_dict()
-        # POST_ONLY flag for Polymarket CLOB
         payload["orderType"] = "GTC"   # Good-til-cancel; CLOB enforces post-only at contract level
 
         url = f"{self._rest_url}/order"
+        body_str = json.dumps(payload, separators=(",", ":"))
+        headers = self._auth_headers("POST", "/order", body_str)
         try:
             async with self._session.post(
-                url, json=payload, timeout=aiohttp.ClientTimeout(total=3.0)
+                url, data=body_str,
+                headers={**headers, "Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=3.0),
             ) as resp:
                 if resp.status in (200, 201):
                     body = await resp.json()
@@ -357,11 +351,21 @@ class OrderManager:
         return order
 
     async def _cancel_order(self, order: ManagedOrder) -> bool:
-        """Cancel a single order. Returns True if cancelled."""
-        url = f"{self._rest_url}/order/{order.order_id}"
+        """Cancel a single order.
+
+        Order id goes in the DELETE body, not the path, since the L2
+        HMAC signature is computed over the body. Path-param DELETE
+        401s with "Invalid api key" even with correct headers, cost me
+        an afternoon figuring that out.
+        """
+        url = f"{self._rest_url}/order"
+        body_str = json.dumps({"orderID": order.order_id}, separators=(",", ":"))
+        headers = self._auth_headers("DELETE", "/order", body_str)
         try:
             async with self._session.delete(
-                url, timeout=aiohttp.ClientTimeout(total=2.0)
+                url, data=body_str,
+                headers={**headers, "Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=2.0),
             ) as resp:
                 if resp.status in (200, 204):
                     order.status = OrderStatus.CANCELLED
@@ -415,8 +419,7 @@ class OrderManager:
         if key in self._live:
             await self._cancel_order(self._live[key])
 
-    # ── Fill handling ─────────────────────────
-
+    # Fill handling
     def mark_filled(self, order_id: str, fill_size: float) -> Optional[ManagedOrder]:
         """Called when the user-stream reports a fill."""
         order = self._all.get(order_id)
@@ -437,8 +440,7 @@ class OrderManager:
         if order:
             order.status = OrderStatus.OPEN
 
-    # ── Introspection ─────────────────────────
-
+    # Introspection
     def get_live_quotes(self, market_id: str) -> Dict[str, Optional[ManagedOrder]]:
         return {
             "BUY":  self._live.get((market_id, "BUY")),
