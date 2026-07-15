@@ -1,23 +1,13 @@
 """
-src/risk/engine.py
-────────────────────
-Independent risk engine.  Runs as a separate asyncio task.
-Never co-located with strategy logic — intentional architectural separation.
+Standalone risk engine. Runs as its own asyncio task, deliberately not
+co-located with strategy logic, if the strategy loop hangs or throws,
+risk checks keep running.
 
-Kill Switch Triggers:
-  1. API failure: ≥3 consecutive order failures
-  2. State desync: book age > STALE_THRESHOLD
-  3. Anomalous latency: fill latency spike > 5× rolling median
-  4. Intraday drawdown > config limit
-  5. Per-unit-time loss rate exceeded
+Kill switch fires on: repeated API failures, stale book, a fill latency
+spike, intraday drawdown breach, or a fast loss over a rolling window.
 
-PnL Decomposition (per market):
-  total_pnl = spread_capture + inventory_pnl + adverse_selection_cost
-
-  - spread_capture:     Σ(fill_price - mid_at_fill) × side_sign × filled_qty
-  - inventory_pnl:      (current_mid - avg_entry) × net_position
-  - adverse_selection:  mid_price_change_after_fill × filled_qty × sign
-                        measured in [0, T_adverse] window after each fill
+PnL is decomposed per market as spread_capture + inventory_pnl +
+adverse_selection_cost, mostly so post-mortems don't turn into guesswork.
 """
 from __future__ import annotations
 
@@ -35,10 +25,7 @@ from config.settings import RiskProfile
 logger = structlog.get_logger(__name__)
 
 
-# ──────────────────────────────────────────────
 # Types
-# ──────────────────────────────────────────────
-
 class KillReason(str, Enum):
     DRAWDOWN         = "intraday_drawdown_limit"
     LOSS_RATE        = "loss_per_time_limit"
@@ -95,10 +82,7 @@ class RiskStatus:
     pnl: Dict[str, PnLSnapshot] = field(default_factory=dict)
 
 
-# ──────────────────────────────────────────────
 # Risk Engine
-# ──────────────────────────────────────────────
-
 class RiskEngine:
     """
     Passive monitor. Publishes kill events to a shared asyncio.Event.
@@ -113,6 +97,8 @@ class RiskEngine:
     BOOK_STALE_S: float = 10.0
     # Latency spike: N × median before alarm
     LATENCY_SPIKE_MULT: float = 5.0
+
+    LOSS_RATE_WINDOW_S: float = 15 * 60.0
 
     def __init__(
         self,
@@ -134,11 +120,20 @@ class RiskEngine:
         self._day_start_ts: float = self._get_day_start()
         # Fill latency rolling window (ms)
         self._latencies: Deque[float] = deque(maxlen=100)
+        # Rolling (ts, cumulative_intraday_pnl) samples for the loss-rate
+        # kill switch , bounded to the loss-rate window plus slack.
+        self._pnl_samples: Deque[Tuple[float, float]] = deque()
 
         self._log = logger.bind(component="risk_engine")
 
-    # ── Main monitor loop ─────────────────────
+    def _record_pnl_sample(self, cum_pnl: float) -> None:
+        now = time.monotonic()
+        self._pnl_samples.append((now, cum_pnl))
+        cutoff = now - self.LOSS_RATE_WINDOW_S - 5.0
+        while self._pnl_samples and self._pnl_samples[0][0] < cutoff:
+            self._pnl_samples.popleft()
 
+    # Main monitor loop
     async def run(self) -> None:
         """Background task: periodic risk checks."""
         while True:
@@ -149,8 +144,7 @@ class RiskEngine:
             self._check_stale_book()
             self._emit_health()
 
-    # ── Event handlers ────────────────────────
-
+    # Event handlers
     def on_fill(
         self,
         market_id: str,
@@ -159,8 +153,21 @@ class RiskEngine:
         fill_size: float,
         side: str,
         mid_at_fill: float,
+        realized_pnl: float = 0.0,
     ) -> None:
-        """Called by order manager after each confirmed fill."""
+        """
+        Called after each confirmed fill.
+
+        `realized_pnl` MUST come from InventoryManager (the single source
+        of truth for position/cost-basis) rather than being recomputed
+        here. RiskEngine previously kept its own parallel VWAP tracker
+        that assumed every SELL closes a long position , it silently
+        produced wrong numbers on position flips (long → short) and
+        diverged from InventoryManager's correct accounting. RiskEngine
+        still mirrors net_qty/avg_entry locally, but only to drive its
+        own unrealized mark-to-market and drawdown check , realized PnL
+        is never recomputed here anymore.
+        """
         ts = time.monotonic()
         ev = FillEvent(
             market_id=market_id,
@@ -174,34 +181,38 @@ class RiskEngine:
 
         pnl = self._get_pnl(market_id)
 
-        # ── Spread capture ─────────────────────
-        # For a BUY fill: we acquired at fill_price, fair value = mid
-        # spread_capture_per_fill = (mid - fill_price) × size   [positive if bought below mid]
+        # Spread capture
         sign = 1 if side == "BUY" else -1
         sc = (mid_at_fill - fill_price) * fill_size * sign
         pnl.spread_capture += sc
 
-        # ── Realized PnL update ───────────────
+        # Realized PnL: trust the caller (InventoryManager)
+        pnl.realized_pnl += realized_pnl
+        self._intraday_pnl += realized_pnl
+        self._record_pnl_sample(self._intraday_pnl)
+
+        # Local position mirror, flip-aware, for mark-to-market only
         inv = self._get_inventory(market_id)
-        old_qty  = inv["net_qty"]
-        old_cost = inv["avg_entry"] * abs(old_qty) if old_qty != 0 else 0.0
+        old_qty = inv["net_qty"]
+        signed_fill = fill_size if side == "BUY" else -fill_size
+        new_qty = old_qty + signed_fill
 
-        if side == "BUY":
-            new_qty = old_qty + fill_size
-            # Update VWAP
-            new_cost = old_cost + fill_price * fill_size
-            inv["avg_entry"] = new_cost / abs(new_qty) if new_qty != 0 else 0.0
-            inv["net_qty"] = new_qty
-        else:  # SELL
-            realized = (fill_price - inv["avg_entry"]) * fill_size
-            pnl.realized_pnl += realized
-            self._intraday_pnl += realized
-            inv["net_qty"] = old_qty - fill_size
+        if old_qty == 0 or (old_qty > 0) == (signed_fill > 0):
+            # Adding to (or opening) a position on the same side: blend VWAP
+            old_notional = inv["avg_entry"] * abs(old_qty)
+            new_notional = old_notional + fill_price * fill_size
+            inv["avg_entry"] = new_notional / abs(new_qty) if new_qty != 0 else 0.0
+        elif abs(signed_fill) > abs(old_qty):
+            # Flip through zero: the excess opens a new position at fill_price
+            inv["avg_entry"] = fill_price
+        # else: partial close, avg_entry (cost basis of remaining) unchanged
 
-        # ── Schedule adverse selection measurement ────
+        inv["net_qty"] = new_qty
+
+        # Schedule adverse selection measurement
         self._pending_as.append((ts + self.AS_WINDOW_S, ev))
 
-        # ── Drawdown check ─────────────────────
+        # Drawdown check
         total_unrealized = self._compute_total_unrealized()
         total_pnl = self._intraday_pnl + total_unrealized
 
@@ -218,6 +229,7 @@ class RiskEngine:
             price=round(fill_price, 4),
             size=fill_size,
             spread_capture=round(sc, 4),
+            realized_pnl=round(realized_pnl, 4),
             intraday_pnl=round(total_pnl, 2),
         )
 
@@ -261,8 +273,7 @@ class RiskEngine:
                     f"Fill latency {latency_ms:.0f}ms = {latency_ms/median:.1f}× median",
                 )
 
-    # ── Internal checks ───────────────────────
-
+    # Internal checks
     def _flush_as_measurements(self) -> None:
         """Compute adverse selection for fills whose window has elapsed."""
         now = time.monotonic()
@@ -286,10 +297,35 @@ class RiskEngine:
                 )
 
     def _check_loss_rate(self) -> None:
-        """Loss per unit time check: rolling 15-minute window."""
-        # Simplified: check if intraday PnL deteriorated too quickly
-        # Full impl would track PnL by minute-bucket
-        pass
+        """
+        Loss-per-unit-time kill switch: if cumulative intraday PnL has
+        dropped by more than `loss_rate_limit_15m` within any rolling
+        15-minute window, kill. This is distinct from the plain drawdown
+        check (which looks at absolute level, not velocity) , it catches
+        a fast bleed that hasn't yet breached the absolute floor.
+        """
+        if not self._pnl_samples:
+            return
+
+        now = time.monotonic()
+        cutoff = now - self.LOSS_RATE_WINDOW_S
+        window_start_pnl = None
+        for ts, pnl in self._pnl_samples:
+            if ts >= cutoff:
+                window_start_pnl = pnl
+                break
+        if window_start_pnl is None:
+            return  # no samples old enough to span the full window yet
+
+        current_pnl = self._pnl_samples[-1][1]
+        loss = window_start_pnl - current_pnl  # positive = lost money over the window
+
+        if loss > self._risk.loss_rate_limit_15m:
+            self._trigger_kill(
+                KillReason.LOSS_RATE,
+                f"Lost {loss:.2f} in rolling 15-min window "
+                f"(limit {self._risk.loss_rate_limit_15m:.2f})",
+            )
 
     def _check_stale_book(self) -> None:
         if self._status.last_book_ts > 0:
@@ -320,6 +356,7 @@ class RiskEngine:
         if day_start > self._day_start_ts:
             self._intraday_pnl = 0.0
             self._day_start_ts = day_start
+            self._pnl_samples.clear()
 
     def _emit_health(self) -> None:
         for mid, pnl in self._pnl.items():
@@ -347,12 +384,11 @@ class RiskEngine:
     @staticmethod
     def _get_day_start() -> float:
         import datetime
-        now = datetime.datetime.utcnow()
-        day_start = datetime.datetime(now.year, now.month, now.day)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        day_start = datetime.datetime(now.year, now.month, now.day, tzinfo=datetime.timezone.utc)
         return day_start.timestamp()
 
-    # ── Properties ────────────────────────────
-
+    # Properties
     @property
     def is_alive(self) -> bool:
         return not self._kill.is_set()
