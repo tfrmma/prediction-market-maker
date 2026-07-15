@@ -1,19 +1,24 @@
 """
-src/data/kalshi_feed.py
-───────────────────────
-Async Kalshi API v2 WebSocket connector.
+Kalshi API v2 websocket connector.
 
-Kalshi specifics:
-  - Markets are single binary contracts (YES/NO folded into one book)
-  - Auth: RSA-PSS signature of (timestamp + method + path) with PKCS8 key
-  - WS commands: subscribe to "orderbook_delta", "ticker" channels
-  - Sequence numbers provided → strict gap detection
-  - Prices in cents [0, 100]; sizes in contracts
+Big gotcha: the orderbook is bids-only on both legs. Kalshi never sends
+an ask array, full stop. A YES ask is just 1 - best NO bid and vice
+versa. We only store raw bid data here per leg, the complement math
+lives in UnifiedBook next to the equivalent Polymarket YES/NO logic.
+
+Auth is RSA-PSS(SHA-256) over (timestamp_ms + method + path), sent as
+KALSHI-ACCESS-* headers on the websocket handshake itself. There's no
+in-band auth message like some other venues use.
+
+Prices come in as fixed-point dollar strings ("0.4200"), not cents, after
+Kalshi's 2026 fixed-point migration. Field names have moved around more
+than once this year (ticker_v2 retirement, the fixed-point switch, the
+new get_snapshot resync action) so treat anything below as best-effort
+and diff it against a live capture before trusting it in prod.
 """
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import time
 from dataclasses import dataclass
@@ -26,22 +31,22 @@ from src.data.base_feed import BaseFeed, RawMessage
 logger = structlog.get_logger(__name__)
 
 
-# ──────────────────────────────────────────────
 # Domain types
-# ──────────────────────────────────────────────
-
 @dataclass(slots=True)
 class KalshiLevel:
     price: float   # probability [0, 1]
-    size: int      # contracts
+    size: float    # contracts (fixed-point, can be fractional)
 
 
 @dataclass
 class KalshiBookSnapshot:
+    """
+    Raw bids-only snapshot for BOTH legs of one Kalshi market.
+    There is no ask data here by design , see module docstring.
+    """
     market_ticker: str
-    yes_bids: List[KalshiLevel]   # sorted desc
-    yes_asks: List[KalshiLevel]   # sorted asc
-    # NOTE: Kalshi quotes YES side only; NO is implicit via 1 - price
+    yes_bids: List[KalshiLevel]   # sorted desc (best first)
+    no_bids:  List[KalshiLevel]   # sorted desc (best first)
     seq: int
     timestamp_ms: int
     recv_ts: float
@@ -50,10 +55,9 @@ class KalshiBookSnapshot:
 @dataclass
 class KalshiBookDelta:
     market_ticker: str
-    side: str         # "yes" | "no" — Kalshi actually quotes YES side
-    action: str       # "add" | "delete"
+    side: str         # "yes" | "no" , which BID book this delta applies to
     price: float      # [0, 1]
-    delta: int        # +/- contracts
+    delta: float      # +/- contracts (fixed-point)
     seq: int
     timestamp_ms: int
     recv_ts: float
@@ -62,8 +66,8 @@ class KalshiBookDelta:
 @dataclass
 class KalshiTrade:
     market_ticker: str
-    price: float
-    size: int
+    yes_price: float
+    size: float
     taker_side: str   # "yes" | "no"
     trade_id: str
     timestamp_ms: int
@@ -74,7 +78,7 @@ class KalshiTrade:
 class KalshiTicker:
     market_ticker: str
     yes_bid: float
-    yes_ask: float
+    yes_ask: float          # as reported by ticker channel (may be derived server-side)
     last_price: float
     volume_24h: int
     open_interest: int
@@ -82,10 +86,7 @@ class KalshiTicker:
     recv_ts: float
 
 
-# ──────────────────────────────────────────────
 # Feed
-# ──────────────────────────────────────────────
-
 class KalshiFeed(BaseFeed):
     """
     Kalshi WS feed.  Emits:
@@ -93,13 +94,14 @@ class KalshiFeed(BaseFeed):
     """
 
     STALE_FEED_TIMEOUT_S = 12.0
+    WS_AUTH_PATH = "/trade-api/ws/v2"
 
     def __init__(
         self,
         ws_url: str,
         tickers: List[str],              # e.g. ["BTC-23DEC-T100K"]
         api_key_id: str,
-        private_key_pem: str,            # RSA-4096 PKCS8 PEM string
+        private_key_pem: str,            # RSA PKCS8 PEM string
         out_queue,
         health_queue=None,
     ):
@@ -111,43 +113,35 @@ class KalshiFeed(BaseFeed):
         self._seq_by_market: Dict[str, int] = {}
         self._log = logger.bind(venue="kalshi", n_markets=len(tickers))
 
-    # ── BaseFeed interface ────────────────────
+    # BaseFeed interface
+    def _extra_ws_headers(self) -> dict:
+        """
+        Kalshi authenticates the WS *handshake* via signed HTTP headers,
+        not via an in-band message. Timestamp must be fresh, so this is
+        computed on every (re)connect.
+        """
+        ts_ms = int(time.time() * 1000)
+        sig = self._sign_rsa(ts_ms, "GET", self.WS_AUTH_PATH)
+        return {
+            "KALSHI-ACCESS-KEY": self._api_key_id,
+            "KALSHI-ACCESS-SIGNATURE": sig,
+            "KALSHI-ACCESS-TIMESTAMP": str(ts_ms),
+        }
 
     async def _build_subscribe_msgs(self) -> list:
         """
-        Kalshi WS v2 auth + subscribe to orderbook_delta + ticker.
-        Auth: RSA-PSS SHA-256 signature.
+        Kalshi WS v2 subscribe. Auth already happened at the handshake
+        (see _extra_ws_headers); no auth command is sent here.
         """
-        ts_ms  = int(time.time() * 1000)
-        method = "GET"
-        path   = "/trade-api/ws/v2"
-        sig    = self._sign_rsa(ts_ms, method, path)
-
-        auth_cmd = {
+        sub = {
             "id": self._next_cmd_id(),
-            "cmd": "auth",
+            "cmd": "subscribe",
             "params": {
-                "apiKey": self._api_key_id,
-                "signature": sig,
-                "timestamp": ts_ms,
+                "channels": ["orderbook_delta", "ticker", "trade"],
+                "market_tickers": self._tickers,
             },
         }
-
-        msgs = [json.dumps(auth_cmd)]
-
-        for ticker in self._tickers:
-            for channel in ("orderbook_delta", "ticker"):
-                sub = {
-                    "id": self._next_cmd_id(),
-                    "cmd": "subscribe",
-                    "params": {
-                        "channels": [channel],
-                        "market_tickers": [ticker],
-                    },
-                }
-                msgs.append(json.dumps(sub))
-
-        return msgs
+        return [json.dumps(sub)]
 
     async def _parse_message(self, raw: RawMessage) -> AsyncIterator:
         try:
@@ -175,11 +169,14 @@ class KalshiFeed(BaseFeed):
             for ev in self._parse_ticker(data, raw.recv_ts):
                 yield ev
 
-        elif msg_type in ("subscribed", "ok", "auth_ok"):
+        elif msg_type in ("subscribed", "ok"):
             pass
 
         elif msg_type == "error":
             self._log.error("kalshi_error", detail=data)
+            code = data.get("code")
+            if code == 9:  # "Authentication required" , headers rejected/expired
+                raise RuntimeError("Kalshi WS auth rejected , check signed headers")
 
         else:
             self._log.debug("unknown_type", msg_type=msg_type)
@@ -195,53 +192,60 @@ class KalshiFeed(BaseFeed):
     def _extract_exchange_ts(self, payload: bytes) -> Optional[int]:
         try:
             msg = json.loads(payload)
-            ts = (msg.get("msg") or {}).get("ts")
-            if ts:
-                # Kalshi timestamps are ISO strings or unix-ms
-                if isinstance(ts, (int, float)):
-                    return int(ts)
-                # If ISO, parse (omitted for brevity)
+            m = msg.get("msg") or {}
+            # Kalshi has been migrating fields towards *_ts_ms; fall back
+            # to legacy "ts" (ISO string or epoch) if present.
+            for key in ("ts_ms", "created_ts_ms"):
+                if key in m and isinstance(m[key], (int, float)):
+                    return int(m[key])
+            ts = m.get("ts")
+            if isinstance(ts, (int, float)):
+                return int(ts)
             return None
         except Exception:
             return None
 
-    # ── Parsers ───────────────────────────────
+    # Parsers
+    @staticmethod
+    def _parse_fp_levels(raw: list) -> List[KalshiLevel]:
+        """
+        Parse a Kalshi fixed-point [price_dollars_str, count_fp_str] level
+        array. Bids only , arrays are one-sided by construction.
+        """
+        out = []
+        for entry in (raw or []):
+            try:
+                price = float(entry[0])
+                size  = float(entry[1])
+                if size > 0:
+                    out.append(KalshiLevel(price=price, size=size))
+            except (IndexError, ValueError, TypeError):
+                continue
+        return out
 
     def _parse_book_snapshot(self, data: dict, recv_ts: float):
         ticker = data.get("market_ticker")
         if ticker not in self._tickers:
             return
 
-        seq    = int(data.get("seq", 0))
-        ts_ms  = int(data.get("ts", 0) or 0)
-
+        seq   = int(data.get("seq", 0))
+        ts_ms = int(data.get("ts_ms", data.get("ts", 0)) or 0)
         self._seq_by_market[ticker] = seq
 
-        def parse_lvls(raw):
-            out = []
-            for entry in (raw or []):
-                try:
-                    out.append(KalshiLevel(
-                        price=float(entry[0]) / 100.0,
-                        size=int(entry[1]),
-                    ))
-                except Exception:
-                    continue
-            return out
+        # Field names have shifted with Kalshi's fixed-point migration;
+        # accept both the *_dollars_fp names and older bare yes/no.
+        # TODO: confirm yes_dollars_fp/no_dollars_fp against a live capture,
+        # docs.kalshi.com has changed this schema twice already this year
+        yes_raw = data.get("yes_dollars_fp") or data.get("yes") or []
+        no_raw  = data.get("no_dollars_fp")  or data.get("no")  or []
 
-        yes_bids = sorted(
-            parse_lvls(data.get("yes", {}).get("bids", [])),
-            key=lambda x: -x.price,
-        )
-        yes_asks = sorted(
-            parse_lvls(data.get("yes", {}).get("asks", [])),
-            key=lambda x: x.price,
-        )
+        yes_bids = sorted(self._parse_fp_levels(yes_raw), key=lambda x: -x.price)
+        no_bids  = sorted(self._parse_fp_levels(no_raw),  key=lambda x: -x.price)
 
         yield KalshiBookSnapshot(
             market_ticker=ticker,
             yes_bids=yes_bids,
-            yes_asks=yes_asks,
+            no_bids=no_bids,
             seq=seq,
             timestamp_ms=ts_ms,
             recv_ts=recv_ts,
@@ -253,7 +257,7 @@ class KalshiFeed(BaseFeed):
             return
 
         seq   = int(data.get("seq", 0))
-        ts_ms = int(data.get("ts", 0) or 0)
+        ts_ms = int(data.get("ts_ms", data.get("ts", 0)) or 0)
 
         # Validate sequence continuity per-market
         last_seq = self._seq_by_market.get(ticker)
@@ -264,37 +268,49 @@ class KalshiFeed(BaseFeed):
                 expected=last_seq + 1,
                 got=seq,
             )
-            # Signal resync needed
             raise RuntimeError(f"Kalshi seq gap on {ticker}: {last_seq} → {seq}")
         self._seq_by_market[ticker] = seq
 
-        for delta in data.get("deltas", []):
-            try:
-                yield KalshiBookDelta(
-                    market_ticker=ticker,
-                    side=delta["side"].lower(),
-                    action=delta["action"].lower(),
-                    price=float(delta["price"]) / 100.0,
-                    delta=int(delta["delta"]),
-                    seq=seq,
-                    timestamp_ms=ts_ms,
-                    recv_ts=recv_ts,
-                )
-            except (KeyError, ValueError):
-                continue
+        side = str(data.get("side", "")).lower()
+        if side not in ("yes", "no"):
+            return
+
+        try:
+            price = float(data.get("price_dollars", data.get("price", 0)))
+            if "price_dollars" not in data and "price" in data:
+                # Legacy cents-integer fallback
+                price = float(data["price"]) / 100.0
+            delta = float(data.get("delta", 0))
+        except (ValueError, TypeError):
+            return
+
+        yield KalshiBookDelta(
+            market_ticker=ticker,
+            side=side,
+            price=price,
+            delta=delta,
+            seq=seq,
+            timestamp_ms=ts_ms,
+            recv_ts=recv_ts,
+        )
 
     def _parse_trade(self, data: dict, recv_ts: float):
         ticker = data.get("market_ticker")
         if ticker not in self._tickers:
             return
         try:
+            yes_price = data.get("yes_price_dollars")
+            if yes_price is None:
+                yes_price = float(data.get("yes_price", 0)) / 100.0
+            else:
+                yes_price = float(yes_price)
             yield KalshiTrade(
                 market_ticker=ticker,
-                price=float(data["yes_price"]) / 100.0,
-                size=int(data["count"]),
-                taker_side=data.get("taker_side", "").lower(),
+                yes_price=yes_price,
+                size=float(data.get("count", 0)),
+                taker_side=str(data.get("taker_side", "")).lower(),
                 trade_id=str(data.get("trade_id", "")),
-                timestamp_ms=int(data.get("ts", 0) or 0),
+                timestamp_ms=int(data.get("ts_ms", data.get("ts", 0)) or 0),
                 recv_ts=recv_ts,
             )
         except (KeyError, ValueError) as exc:
@@ -305,21 +321,25 @@ class KalshiFeed(BaseFeed):
         if ticker not in self._tickers:
             return
         try:
+            def _dollars(key_dollars: str, key_cents: str) -> float:
+                if key_dollars in data:
+                    return float(data[key_dollars])
+                return float(data.get(key_cents, 0)) / 100.0
+
             yield KalshiTicker(
                 market_ticker=ticker,
-                yes_bid=float(data.get("yes_bid", 0)) / 100.0,
-                yes_ask=float(data.get("yes_ask", 0)) / 100.0,
-                last_price=float(data.get("last_price", 0)) / 100.0,
+                yes_bid=_dollars("yes_bid_dollars", "yes_bid"),
+                yes_ask=_dollars("yes_ask_dollars", "yes_ask"),
+                last_price=_dollars("last_price_dollars", "last_price"),
                 volume_24h=int(data.get("volume_24h", 0) or 0),
                 open_interest=int(data.get("open_interest", 0) or 0),
-                timestamp_ms=int(data.get("ts", 0) or 0),
+                timestamp_ms=int(data.get("ts_ms", data.get("ts", 0)) or 0),
                 recv_ts=recv_ts,
             )
         except (KeyError, ValueError) as exc:
             self._log.warning("bad_ticker", error=str(exc))
 
-    # ── Auth ─────────────────────────────────
-
+    # Auth
     @staticmethod
     def _load_rsa_key(pem: str):
         """Load RSA private key from PEM string."""
@@ -333,7 +353,10 @@ class KalshiFeed(BaseFeed):
 
     def _sign_rsa(self, timestamp_ms: int, method: str, path: str) -> str:
         """
-        Kalshi v2 auth: RSA-PSS SHA-256 over (timestamp + method + path).
+        Kalshi v2 auth: RSA-PSS SHA-256 over (timestamp_ms + method + path).
+        salt_length = digest size (32 bytes), per docs.kalshi.com's own
+        quick-start example , NOT PSS.MAX_LENGTH, which some third-party
+        guides use inconsistently and can fail signature verification.
         Returns base64-encoded signature.
         """
         from cryptography.hazmat.primitives import hashes
@@ -344,7 +367,7 @@ class KalshiFeed(BaseFeed):
             msg,
             padding.PSS(
                 mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH,
+                salt_length=hashes.SHA256().digest_size,
             ),
             hashes.SHA256(),
         )
