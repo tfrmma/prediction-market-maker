@@ -1,48 +1,37 @@
 """
-src/pricing/fair_value.py
-──────────────────────────
 Pricing engine for binary prediction markets.
 
-THEORETICAL FOUNDATION:
+Reservation price and spread are an Avellaneda-Stoikov adaptation for
+binaries. Standard A-S for a continuous asset:
 
-1. AVELLANEDA-STOIKOV ADAPTATION FOR BINARY MARKETS
-   ────────────────────────────────────────────────
-   Standard A-S for continuous assets:
-     r(s,q,t) = s - q·γ·σ²·(T-t)        [reservation price]
-     δ* = γ·σ²·(T-t) + (2/γ)·ln(1 + γ/k) [optimal half-spread]
+    r(s,q,t) = s - q * gamma * sigma^2 * (T-t)
+    delta*   = gamma * sigma^2 * (T-t) + (2/gamma) * ln(1 + gamma/k)
 
-   Binary market adaptation:
-     - s ∈ [0,1] is the mid probability (not a price)
-     - Payoff is discrete: 1 if YES resolves, 0 if NO
-     - σ² = p·(1-p) is the binary variance (Bernoulli)
-     - γ: risk aversion (calibrated from max drawdown tolerance)
-     - k: arrival rate decay (calibrated from historical fills)
-     - T-t: time to resolution in YEARS (maintains dimensional consistency)
-     - q: inventory in contracts (signed: long=positive, short=negative)
-     - q_max: maximum inventory from risk profile
+For a binary, s is the mid probability in [0,1], payoff is 0/1, and
+variance is just Bernoulli: sigma^2 = p*(1-p). gamma is risk aversion
+(calibrate off max drawdown tolerance), k is arrival-rate decay
+(calibrate off historical fills), T-t is time to resolution in years so
+units stay consistent, q is signed inventory in contracts.
 
-   Reservation price:
-     r = p_mid - q·γ·p·(1-p)·(T-t)
+    r  = p_mid - q * gamma * p*(1-p) * (T-t)
+    delta* = gamma * p*(1-p) * (T-t) + (1/gamma) * ln(1 + gamma/k)
 
-   Optimal half-spread:
-     δ* = γ·p·(1-p)·(T-t) + (1/γ)·ln(1 + γ/k)
+Spread collapses to nothing as T-t -> 0 (pull back on quoting near
+resolution), and is widest around p=0.5 where variance peaks.
 
-   Note: Near resolution (T-t → 0), spread collapses → reduce quoting.
-   Near p=0.5, σ² is maximized → widest spreads appropriate.
+Flow adjustment layers a regression term on top:
 
-2. FLOW ADJUSTMENT
-   ──────────────
-   P_fair = P_base + α·CVD + β·OFI_normalized
+    P_fair = P_base + alpha*CVD + beta*OFI_normalized
 
-   where α, β are calibrated from rolling regression of
-   aggressive flow on subsequent mid-price moves.
+alpha/beta come from a rolling regression of aggressive flow against
+subsequent mid moves.
 
-3. FAVORITE-LONGSHOT BIAS CORRECTION (Kalshi)
-   ──────────────────────────────────────────
-   Empirical finding: retail markets overweight low-probability events.
-   Calibration: fit a power-law transform from historical resolution data.
-   P_true = P_market^κ / (P_market^κ + (1-P_market)^κ)   [Prelec, 1998]
-   κ < 1 corrects for longshot bias; κ = 1 means no correction.
+For Kalshi we also correct favorite-longshot bias with a Prelec (1998)
+power-law transform, retail books tend to overweight longshots:
+
+    P_true = P_market^k / (P_market^k + (1-P_market)^k)
+
+k < 1 corrects for the bias, k = 1 is a no-op.
 """
 from __future__ import annotations
 
@@ -59,10 +48,7 @@ from src.data.unified_book import MarketState
 logger = structlog.get_logger(__name__)
 
 
-# ──────────────────────────────────────────────
 # Model Parameters
-# ──────────────────────────────────────────────
-
 @dataclass
 class ASBinaryParams:
     """
@@ -86,10 +72,7 @@ class ASBinaryParams:
     min_ttres_s: float = 3600.0  # 1 hour before resolution
 
 
-# ──────────────────────────────────────────────
 # Fair Value Output
-# ──────────────────────────────────────────────
-
 @dataclass
 class FairValueResult:
     market_id: str
@@ -115,10 +98,7 @@ class FairValueResult:
     longshot_corrected: bool = False
 
 
-# ──────────────────────────────────────────────
 # Core Pricing Engine
-# ──────────────────────────────────────────────
-
 class FairValueEngine:
     """
     Stateless pricing computation. Thread-safe (no mutable state).
@@ -146,17 +126,17 @@ class FairValueEngine:
         """
         now = time.time()
 
-        # ── 1. Base probability ───────────────
+        # 1. Base probability
         p_base = state.p_mid
 
-        # ── 2. Longshot bias correction ───────
+        # 2. Longshot bias correction
         if apply_bias_correction:
             p_base = self._prelec_correction(p_base, params.kappa)
             longshot_corrected = True
         else:
             longshot_corrected = False
 
-        # ── 3. Flow adjustment ────────────────
+        # 3. Flow adjustment
         #
         # Normalize OFI by total depth to get a [-1, +1] signal
         ofi_norm = state.imbalance  # already normalized in UnifiedBook
@@ -168,22 +148,22 @@ class FairValueEngine:
 
         p_fair = np.clip(p_base + flow_adj, 0.001, 0.999)
 
-        # ── 4. Binary variance ────────────────
+        # 4. Binary variance
         # σ² = p·(1-p), maximized at p=0.5
         sigma_sq = p_fair * (1.0 - p_fair)
 
-        # ── 5. Time to resolution ─────────────
+        # 5. Time to resolution
         ttres_s = max(0.0, state.time_to_resolution_s)
         ttres_years = ttres_s / self.SECONDS_PER_YEAR
 
-        # ── 6. Quoting guard ──────────────────
+        # 6. Quoting guard
         should_quote = (
             state.is_valid() and
             ttres_s > params.min_ttres_s and
             state.spread < 0.25  # market not completely illiquid
         )
 
-        # ── 7. Reservation price (inventory skew) ─────
+        # 7. Reservation price (inventory skew)
         # r = p_fair - q·γ·σ²·(T-t)
         inv_skew = -inventory_q * params.gamma * sigma_sq * ttres_years
 
@@ -193,7 +173,7 @@ class FairValueEngine:
 
         p_reservation = np.clip(p_fair + inv_skew, 0.001, 0.999)
 
-        # ── 8. Optimal half-spread ────────────
+        # 8. Optimal half-spread
         #
         # δ* = γ·σ²·(T-t) + (1/γ)·ln(1 + γ/k)
         #
@@ -211,7 +191,7 @@ class FairValueEngine:
         # Apply guardrails
         half_spread = max(params.min_half_spread, min(params.max_half_spread, half_spread))
 
-        # ── 9. Quote prices ───────────────────
+        # 9. Quote prices
         #
         # Center quotes around reservation price, not fair value.
         # This is the inventory-management asymmetry: if long,
@@ -230,7 +210,7 @@ class FairValueEngine:
             bid_quote = round(mid_q - tick, 4)
             ask_quote = round(mid_q + tick, 4)
 
-        # ── 10. Staleness check ───────────────
+        # 10. Staleness check
         age_s = now - (state.book_ts_ms / 1000.0) if state.book_ts_ms else 0
         is_stale = age_s > 5.0   # book older than 5s = stale
 
@@ -252,8 +232,7 @@ class FairValueEngine:
             longshot_corrected=longshot_corrected,
         )
 
-    # ── Bias correction ───────────────────────
-
+    # Bias correction
     @staticmethod
     def _prelec_correction(p_market: float, kappa: float) -> float:
         """
@@ -281,10 +260,7 @@ class FairValueEngine:
         return float(np.clip(p_true, 0.001, 0.999))
 
 
-# ──────────────────────────────────────────────
 # Rolling Calibrator
-# ──────────────────────────────────────────────
-
 class ParameterCalibrator:
     """
     Online calibration of (γ, k, α, β) from observed fills and price paths.
