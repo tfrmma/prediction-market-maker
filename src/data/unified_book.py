@@ -1,27 +1,18 @@
 """
-src/data/unified_book.py
-─────────────────────────
-Core State Engine: Unified YES/NO synthetic probability matrix.
+Folds venue-specific order books into one synthetic YES/NO probability
+state per market, this is what the pricing layer actually consumes.
 
-KEY DESIGN:
-  Polymarket has two separate token books: YES and NO.
-  The no-arbitrage constraint:
+Polymarket gives us two independent books (YES, NO). No-arb says:
 
-      Bid_YES  ≤  1 - Ask_NO   (otherwise: buy YES + buy NO < $1 → free money)
-      Ask_YES  ≥  1 - Bid_NO
+    bid_YES <= 1 - ask_NO   (otherwise buy YES + buy NO < $1, free money)
+    ask_YES >= 1 - bid_NO
 
-  This module:
-    1. Maintains L2 books for YES and NO sides independently
-    2. Folds them into a SINGLE synthetic probability density matrix
-    3. Computes:
-       - Synthetic mid:   P_mid  = (Bid_YES_mid + (1 - Ask_NO_mid)) / 2
-       - Implied spread:  Σ      = Ask_YES - Bid_YES  (and 1-side equivalent)
-       - Order Flow Imbalance (OFI): depth-weighted buy/sell pressure
-       - CVD (Cumulative Volume Delta): aggressive taker direction
-       - Arbitrage signal:  arb_gap = Bid_YES + Bid_NO - 1.0  (>0 = arb exists)
-    4. Emits a MarketState snapshot on every update (consumed by pricing layer)
+We keep L2 books for both legs, blend them into a synthetic mid, spread,
+OFI, CVD, and an arb_gap signal (bid_YES + bid_NO - 1.0, positive means
+there's an arb sitting there). Every update emits a MarketState snapshot.
 
-Handles both Polymarket (two-token) and Kalshi (single YES-side book).
+Kalshi only ever gives us bids on both legs (see kalshi_feed.py), so the
+"other side" of each book is always derived, never read off the wire.
 """
 from __future__ import annotations
 
@@ -48,13 +39,13 @@ from src.data.kalshi_feed import (
     KalshiTicker,
 )
 
+# NB: Kalshi's no_book bids never populate an ask side, that's always
+# derived (ask_yes = 1 - bid_no). See kalshi_feed.py for why.
+
 logger = structlog.get_logger(__name__)
 
 
-# ──────────────────────────────────────────────
 # Output types
-# ──────────────────────────────────────────────
-
 class BookSource(str, Enum):
     POLYMARKET = "polymarket"
     KALSHI     = "kalshi"
@@ -77,10 +68,10 @@ class MarketState:
     source: BookSource
     ts: float              # monotonic
 
-    # ── Synthetic probability ──────────────
+    # Synthetic probability
     p_mid: float           # best estimate of true probability [0, 1]
-    p_bid: float           # best bid (YES side)  — highest willing buyer
-    p_ask: float           # best ask (YES side)  — lowest willing seller
+    p_bid: float           # best bid (YES side)  , highest willing buyer
+    p_ask: float           # best ask (YES side)  , lowest willing seller
     spread: float          # p_ask - p_bid
     
     # From NO side (only Polymarket)
@@ -90,27 +81,27 @@ class MarketState:
     # Arb signal (Poly only): > 0 means risk-free profit exists
     arb_gap: float = 0.0   # Bid_YES + Bid_NO - 1  (should be ≤ 0 in efficient market)
 
-    # ── Order book depth ──────────────────
+    # Order book depth
     bids: List[DepthLevel] = field(default_factory=list)   # top-5 YES bids
     asks: List[DepthLevel] = field(default_factory=list)   # top-5 YES asks
 
-    # ── Flow metrics ──────────────────────
+    # Flow metrics
     ofi: float = 0.0          # Order Flow Imbalance (positive = buy pressure)
     cvd: float = 0.0          # Cumulative Volume Delta (rolling window)
     
-    # ── Volatility proxy ──────────────────
+    # Volatility proxy
     realized_vol_1m: float = 0.0    # σ of mid-price changes over 1-min window
     
-    # ── Liquidity metrics ─────────────────
+    # Liquidity metrics
     bid_depth_usd: float = 0.0     # total bid liquidity in top 5 levels
     ask_depth_usd: float = 0.0     # total ask liquidity in top 5 levels
     imbalance: float = 0.0         # (bid_depth - ask_depth) / (bid_depth + ask_depth)
 
-    # ── Time to resolution ────────────────
+    # Time to resolution
     resolution_ts: int = 0         # unix timestamp
     time_to_resolution_s: float = 0.0
 
-    # ── Exchange timestamps ───────────────
+    # Exchange timestamps
     book_ts_ms: int = 0
     last_trade_price: Optional[float] = None
     last_trade_size: Optional[float] = None
@@ -126,10 +117,7 @@ class MarketState:
         return True
 
 
-# ──────────────────────────────────────────────
 # L2 Book: mutable in-memory representation
-# ──────────────────────────────────────────────
-
 class L2Book:
     """
     Thread-safe-ish (single-threaded asyncio) L2 order book.
@@ -170,6 +158,10 @@ class L2Book:
             book[price] = size
         self._ts_ms = max(self._ts_ms, ts_ms)
         self._trim()
+
+    def size_at_bid(self, price: float) -> float:
+        """Current resting size at a specific bid price level, or 0."""
+        return self._bids.get(price, 0.0)
 
     def best_bid(self) -> Optional[Tuple[float, float]]:
         if not self._bids:
@@ -215,10 +207,7 @@ class L2Book:
         return self._ts_ms
 
 
-# ──────────────────────────────────────────────
 # OFI + CVD rolling state
-# ──────────────────────────────────────────────
-
 @dataclass
 class OFIState:
     """
@@ -289,10 +278,7 @@ class MidHistory:
             self._mids.popleft()
 
 
-# ──────────────────────────────────────────────
 # Unified Book (main class)
-# ──────────────────────────────────────────────
-
 class UnifiedBook:
     """
     Manages the combined YES/NO probability surface for one market.
@@ -322,15 +308,14 @@ class UnifiedBook:
 
         # Flags
         self._yes_initialized = False
-        self._no_initialized  = False   # Kalshi: always True (single book)
-
-        if source == BookSource.KALSHI:
-            self._no_initialized = True   # NO is implicit via complement
+        self._no_initialized  = False
+        # Kalshi ticks may report only a "yes"-key trade/ticker event even
+        # before any book snapshot has arrived; those alone don't count as
+        # "initialized" , we require the book leg itself to have been seen.
 
         self._log = logger.bind(market_id=market_id, source=source.value)
 
-    # ── Public entry point ────────────────────
-
+    # Public entry point
     def process(self, event) -> Optional[MarketState]:
         """
         Dispatch any feed event. Returns updated MarketState or None.
@@ -349,8 +334,7 @@ class UnifiedBook:
             return self._handle_kalshi_ticker_or_trade(event)
         return None
 
-    # ── Polymarket handlers ───────────────────
-
+    # Polymarket handlers
     def _handle_poly_snapshot(self, ev: PolyBookSnapshot) -> Optional[MarketState]:
         book = self._yes_book if ev.is_yes_token else self._no_book
         book.apply_snapshot(ev.bids, ev.asks, ev.timestamp_ms)
@@ -389,56 +373,71 @@ class UnifiedBook:
         )
         return self._build_state(ev.recv_ts, ev.timestamp_ms)
 
-    # ── Kalshi handlers ───────────────────────
-
+    # Kalshi handlers
     def _handle_kalshi_snapshot(self, ev: KalshiBookSnapshot) -> Optional[MarketState]:
-        # Kalshi provides YES side; we store NO as complement
-        # Convert KalshiLevel → PriceLevel-compatible for L2Book
-        bids = [PriceLevel(price=lvl.price, size=float(lvl.size)) for lvl in ev.yes_bids]
-        asks = [PriceLevel(price=lvl.price, size=float(lvl.size)) for lvl in ev.yes_asks]
-        self._yes_book.apply_snapshot(bids, asks, ev.timestamp_ms)
+        """Store YES bids and NO bids separately, asks get derived in _build_state."""
+        yes_bids = [PriceLevel(price=lvl.price, size=lvl.size) for lvl in ev.yes_bids]
+        no_bids  = [PriceLevel(price=lvl.price, size=lvl.size) for lvl in ev.no_bids]
+        self._yes_book.apply_snapshot(yes_bids, [], ev.timestamp_ms)
+        self._no_book.apply_snapshot(no_bids, [], ev.timestamp_ms)
         self._yes_initialized = True
+        self._no_initialized  = True
         return self._build_state(ev.recv_ts, ev.timestamp_ms)
 
     def _handle_kalshi_delta(self, ev: KalshiBookDelta) -> Optional[MarketState]:
-        # Kalshi delta only quotes YES side
-        # "yes" bid delta → BUY side update
-        raw_side = "BUY" if ev.side == "yes" and ev.action in ("add",) else "SELL"
-        size = float(ev.delta) if ev.action == "add" else 0.0
-        self._yes_book.apply_delta(raw_side, ev.price, size, ev.timestamp_ms)
+        """delta is a signed size change against the existing level, not an absolute value."""
+        book = self._yes_book if ev.side == "yes" else self._no_book
+        existing = book.size_at_bid(ev.price)
+        new_size = max(0.0, existing + ev.delta)
+        book.apply_delta("BUY", ev.price, new_size, ev.timestamp_ms)
+
+        if not (self._yes_initialized and self._no_initialized):
+            # shouldn't happen per protocol, but don't emit garbage if it does
+            return None
         return self._build_state(ev.recv_ts, ev.timestamp_ms)
 
     def _handle_kalshi_ticker_or_trade(self, ev) -> Optional[MarketState]:
         if isinstance(ev, KalshiTrade):
             self._cvd.add_trade(
                 ts=time.monotonic(),
-                price=ev.price,
+                price=ev.yes_price,
                 size=float(ev.size),
                 taker_side="YES" if ev.taker_side == "yes" else "NO",
             )
+        if not (self._yes_initialized and self._no_initialized):
+            return None
         return self._build_state(ev.recv_ts, getattr(ev, "timestamp_ms", 0))
 
-    # ── State construction ────────────────────
+    # State construction
+    @staticmethod
+    def _complement_levels(bid_levels: List[DepthLevel]) -> List[DepthLevel]:
+        """Bids on the other leg -> synthetic asks on this leg (price = 1 - price)."""
+        return sorted(
+            (DepthLevel(price=1.0 - lvl.price, size=lvl.size) for lvl in bid_levels),
+            key=lambda x: x.price,
+        )
 
     def _build_state(self, recv_ts: float, book_ts_ms: int) -> Optional[MarketState]:
         if not (self._yes_initialized and self._no_initialized):
             return None  # not ready yet
 
         yes_bid_lvl = self._yes_book.best_bid()
-        yes_ask_lvl = self._yes_book.best_ask()
-
-        if yes_bid_lvl is None or yes_ask_lvl is None:
+        if yes_bid_lvl is None:
             return None  # empty book
-
         p_bid_yes = yes_bid_lvl[0]
-        p_ask_yes = yes_ask_lvl[0]
 
-        # NO-side complement (Polymarket)
         arb_gap  = 0.0
         p_bid_no = None
         p_ask_no = None
+        p_ask_yes = None
 
         if self._source == BookSource.POLYMARKET:
+            # Two independent CLOB books, each with real bids AND asks.
+            yes_ask_lvl = self._yes_book.best_ask()
+            if yes_ask_lvl is None:
+                return None
+            p_ask_yes = yes_ask_lvl[0]
+
             no_bid_lvl = self._no_book.best_bid()
             no_ask_lvl = self._no_book.best_ask()
 
@@ -462,19 +461,44 @@ class UnifiedBook:
                     )
             else:
                 p_mid = (p_bid_yes + p_ask_yes) / 2
+
+            bids_top, asks_top = self._yes_book.top_levels(5)
+            bid_d, ask_d = self._yes_book.depth_usd(n=5)
+
         else:
+            # KALSHI: no real asks anywhere, everything on that side comes
+            # from the other leg's bid.
+            no_bid_lvl = self._no_book.best_bid()
+            if no_bid_lvl is None:
+                return None  # can't derive a YES ask without a NO bid
+            p_bid_no  = no_bid_lvl[0]
+            p_ask_yes = 1.0 - p_bid_no
+            p_ask_no  = 1.0 - p_bid_yes
+
             p_mid = (p_bid_yes + p_ask_yes) / 2
+            arb_gap = p_bid_yes + p_bid_no - 1.0
+            if arb_gap > 0.005:
+                self._log.warning(
+                    "arb_detected",
+                    arb_gap=round(arb_gap, 4),
+                    p_bid_yes=p_bid_yes,
+                    p_bid_no=p_bid_no,
+                )
+
+            yes_bids_top, _ = self._yes_book.top_levels(5)
+            no_bids_top, _  = self._no_book.top_levels(5)
+            bids_top = yes_bids_top
+            asks_top = self._complement_levels(no_bids_top)
+
+            bid_d = sum(lvl.price * lvl.size for lvl in bids_top)
+            ask_d = sum((1 - lvl.price) * lvl.size for lvl in asks_top)
 
         # OFI
-        bid_d, ask_d = self._yes_book.depth_usd(n=5)
         ofi = self._ofi.update(bid_d, ask_d)
 
         # Realized vol
         self._mids.add(recv_ts, p_mid)
         vol = self._mids.realized_vol()
-
-        # Top levels
-        bids_top, asks_top = self._yes_book.top_levels(5)
 
         # Imbalance
         imb = 0.0
@@ -510,10 +534,7 @@ class UnifiedBook:
         )
 
 
-# ──────────────────────────────────────────────
 # Registry: multiple markets managed together
-# ──────────────────────────────────────────────
-
 class BookRegistry:
     """
     Manages one UnifiedBook per market.
