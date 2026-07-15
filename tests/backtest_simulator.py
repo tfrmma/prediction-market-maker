@@ -1,48 +1,32 @@
 """
-tests/backtest_simulator.py
-────────────────────────────
-Research-grade backtesting simulator for the prediction market MM engine.
+Backtest simulator for the MM engine. Not a replay of real fills, this
+generates a synthetic environment to sanity check parameter choices.
 
-SIMULATION MODEL:
+Order arrivals: independent Poisson processes per side, intensity decays
+with spread distance per Avellaneda-Stoikov (2008):
 
-1. ORDER ARRIVALS
-   ──────────────
-   Bid/ask arrivals follow independent Poisson processes with
-   intensity λ(δ) that decays with spread distance:
-     λ(δ) = A·exp(-k·δ)    [Avellaneda-Stoikov, 2008]
-   
-   where:
-     δ = |quoted_price - mid|   (half-spread in probability units)
-     A = base arrival rate (fills/second at δ=0)
-     k = arrival rate decay
+    lambda(delta) = A * exp(-k*delta)
 
-2. VOLATILITY CLUSTERING
-   ──────────────────────
-   Mid-price dynamics follow GARCH(1,1) to reproduce fat tails
-   and volatility clustering observed in prediction markets:
-     σ²_t = ω + α·ε²_{t-1} + β·σ²_{t-1}
-     ε_t = σ_t·z_t,   z_t ~ N(0,1)
+delta is half-spread in probability units, A is the base fill rate at
+delta=0, k is the decay constant.
 
-3. TOXIC FLOW EVENTS
-   ──────────────────
-   With probability p_toxic per arrival:
-     - Informed trader arrives who knows the true value
-     - Their order permanently shifts mid by δ_adverse
-     - Simulates news-driven flow / insider information
-   
-   This generates adverse selection in the PnL decomposition.
+Mid-price follows a GARCH(1,1) so we get fat tails and vol clustering
+instead of boring Brownian motion:
 
-4. RESOLUTION
-   ──────────
-   At T=resolution_ts: market resolves to 1 or 0
-   based on the final mid-price crossing 0.5.
-   PnL settled on all open positions.
+    sigma_t^2 = omega + alpha*eps_{t-1}^2 + beta*sigma_{t-1}^2
+    eps_t = sigma_t * z_t,  z_t ~ N(0,1)
 
-WALK-FORWARD VALIDATION:
-  Splits simulation into N rolling windows.
-  Trains parameters (γ, k, α, β) on in-sample.
-  Evaluates on out-of-sample.
-  Reports Sharpe, max_drawdown, adverse_selection_rate per fold.
+Toxic flow: with probability p_toxic per arrival, an informed trader
+shows up and permanently shifts mid by delta_adverse, this is what drives
+adverse selection in the PnL decomposition. Crude but good enough to
+catch a gamma that's badly miscalibrated.
+
+At resolution_ts the market settles to 1 or 0 based on which side of 0.5
+the final mid landed on, and all open positions get marked out.
+
+Walk-forward validation splits the run into N rolling windows, fits
+gamma/k/alpha/beta in-sample, scores out-of-sample, and reports Sharpe,
+max drawdown and adverse selection rate per fold.
 """
 from __future__ import annotations
 
@@ -63,10 +47,7 @@ from config.settings import RiskProfile
 logger = structlog.get_logger(__name__)
 
 
-# ──────────────────────────────────────────────
 # Simulation Parameters
-# ──────────────────────────────────────────────
-
 @dataclass
 class SimConfig:
     # Market
@@ -101,14 +82,11 @@ class SimConfig:
     wf_train_frac: float = 0.70
 
 
-# ──────────────────────────────────────────────
 # Market Simulator
-# ──────────────────────────────────────────────
-
 class MarketSimulator:
     """
     Generates synthetic market data using GARCH + Poisson arrivals.
-    Pure data generation — no strategy logic.
+    Pure data generation , no strategy logic.
     """
 
     def __init__(self, cfg: SimConfig):
@@ -123,7 +101,7 @@ class MarketSimulator:
         cfg = self._cfg
         n_steps = int(cfg.resolution_s / cfg.tick_s)
 
-        # ── GARCH mid-price path ──────────────
+        # GARCH mid-price path
         mids = np.zeros(n_steps + 1)
         vols = np.zeros(n_steps + 1)
         mids[0] = cfg.p0
@@ -143,7 +121,7 @@ class MarketSimulator:
             shock = vols[t] * z[t-1] if t > 0 else 0.0
             mids[t] = np.clip(mids[t-1] + shock, 0.001, 0.999)
 
-        # ── Toxic flow injection ──────────────
+        # Toxic flow injection
         n_toxic = self._rng.binomial(n_steps, cfg.p_toxic)
         toxic_times = sorted(self._rng.choice(n_steps, size=n_toxic, replace=False))
         toxic_direction = self._rng.choice([-1, 1], size=n_toxic)
@@ -153,7 +131,7 @@ class MarketSimulator:
             # Toxic event permanently shifts mid from t onward
             mids[t:] = np.clip(mids[t:] + impact, 0.001, 0.999)
 
-        # ── Resolution ────────────────────────
+        # Resolution
         resolved_yes = mids[-1] >= 0.5
 
         return SimPath(
@@ -167,10 +145,7 @@ class MarketSimulator:
         )
 
 
-# ──────────────────────────────────────────────
 # Simulation Path
-# ──────────────────────────────────────────────
-
 @dataclass
 class FillRecord:
     t: float
@@ -223,10 +198,7 @@ class SimPath:
         return (u[0] < p_bid_fill, u[1] < p_ask_fill)
 
 
-# ──────────────────────────────────────────────
 # Backtest Runner
-# ──────────────────────────────────────────────
-
 @dataclass
 class BacktestResult:
     # Performance
@@ -333,7 +305,7 @@ class BacktestRunner:
             vol = path.vols[t]
             ttres_s = max(0.0, resolution_ts - t * dt)
 
-            # ── Build synthetic MarketState ────
+            # Build synthetic MarketState
             state = MarketState(
                 market_id="sim_market",
                 source=BookSource.POLYMARKET,
@@ -353,7 +325,7 @@ class BacktestRunner:
                 book_ts_ms=int(t * dt * 1000),
             )
 
-            # ── Compute fair value ─────────────
+            # Compute fair value
             fv = self._pricer.compute(
                 state=state,
                 inventory_q=inventory_q,
@@ -369,7 +341,7 @@ class BacktestRunner:
             bid_q = fv.bid_quote
             ask_q = fv.ask_quote
 
-            # ── Simulate arrivals ─────────────
+            # Simulate arrivals
             bid_hit, ask_hit = path.simulate_arrivals(bid_q, ask_q, t, dt)
 
             is_toxic = t in path.toxic_times
@@ -410,7 +382,7 @@ class BacktestRunner:
                     if is_toxic:
                         n_toxic_fills += 1
 
-            # ── Measure adverse selection ──────
+            # Measure adverse selection
             ready_as = [(idx, f) for idx, f in pending_as if t - idx >= self.AS_WINDOW_TICKS]
             for fill_idx, fr in ready_as:
                 mid_then = path.mids[min(fill_idx + self.AS_WINDOW_TICKS, n_steps)]
@@ -420,7 +392,7 @@ class BacktestRunner:
             pending_as = [(idx, f) for idx, f in pending_as
                           if t - idx < self.AS_WINDOW_TICKS]
 
-            # ── Mark-to-market total PnL ───────
+            # Mark-to-market total PnL
             unrealized = inventory_q * (mid - (
                 sum(f.price * f.size for f in fills if f.side=="BUY") /
                 max(sum(f.size for f in fills if f.side=="BUY"), 1e-9)
@@ -429,7 +401,7 @@ class BacktestRunner:
             pnl_series.append(total_pnl_t)
             inventory_series.append(inventory_q)
 
-        # ── Resolution settlement ──────────────
+        # Resolution settlement
         resolution_price = 1.0 if path.resolved_yes else 0.0
         if inventory_q > 0:
             avg_entry = (sum(f.price * f.size for f in fills if f.side == "BUY") /
@@ -446,7 +418,7 @@ class BacktestRunner:
         final_pnl = realized_pnl
         pnl_series.append(final_pnl)
 
-        # ── Risk metrics ───────────────────────
+        # Risk metrics
         pnl_arr = np.array(pnl_series)
         returns = np.diff(pnl_arr)
         sharpe = (np.mean(returns) / max(np.std(returns), 1e-9)) * math.sqrt(
@@ -484,10 +456,7 @@ class BacktestRunner:
         )
 
 
-# ──────────────────────────────────────────────
 # Walk-Forward Validator
-# ──────────────────────────────────────────────
-
 @dataclass
 class WalkForwardFold:
     fold: int
@@ -542,14 +511,14 @@ class WalkForwardReport:
 
         # Quality assessment
         if self.mean_oos_sharpe < 1.0:
-            print("⚠  OOS Sharpe < 1.0 — strategy not viable without reparametrization")
+            print("⚠  OOS Sharpe < 1.0 , strategy not viable without reparametrization")
         elif self.mean_oos_sharpe < 2.0:
-            print("⚡ OOS Sharpe 1-2 — marginal; reduce adverse selection costs")
+            print("⚡ OOS Sharpe 1-2 , marginal; reduce adverse selection costs")
         else:
-            print("✓  OOS Sharpe > 2.0 — strategy viable; target Sharpe > 3.0 in live")
+            print("✓  OOS Sharpe > 2.0 , strategy viable; target Sharpe > 3.0 in live")
 
         if self.mean_degradation > 0.5:
-            print("⚠  Degradation > 50% — significant overfitting detected")
+            print("⚠  Degradation > 50% , significant overfitting detected")
 
 
 class WalkForwardValidator:
@@ -652,10 +621,7 @@ class WalkForwardValidator:
         )
 
 
-# ──────────────────────────────────────────────
 # Monte Carlo Runner
-# ──────────────────────────────────────────────
-
 class MonteCarloRunner:
     """
     Run N independent paths to estimate PnL distribution.
@@ -711,10 +677,7 @@ class MonteCarloRunner:
         return summary
 
 
-# ──────────────────────────────────────────────
 # CLI entry point
-# ──────────────────────────────────────────────
-
 if __name__ == "__main__":
     import argparse
 
