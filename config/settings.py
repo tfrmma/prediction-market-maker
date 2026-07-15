@@ -1,8 +1,6 @@
 """
-config/settings.py
-──────────────────
-Central config. All hard limits enforced here; strategy code imports,
-never overrides. Production override via env vars or .env file.
+Central config. Hard limits live here, strategy code only ever reads
+them. Override via env vars or a .env file in prod.
 """
 from __future__ import annotations
 
@@ -14,10 +12,7 @@ from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings  # pydantic v2 compat shim
 
 
-# ──────────────────────────────────────────────
 # Venue Enums
-# ──────────────────────────────────────────────
-
 class Venue(str, Enum):
     POLYMARKET = "polymarket"
     KALSHI     = "kalshi"
@@ -25,10 +20,7 @@ class Venue(str, Enum):
     BINANCE    = "binance"
 
 
-# ──────────────────────────────────────────────
 # Risk Profile (per-market)
-# ──────────────────────────────────────────────
-
 class RiskProfile(BaseModel):
     """
     Hard limits evaluated by the independent RiskEngine.
@@ -38,6 +30,7 @@ class RiskProfile(BaseModel):
     max_gross_exposure_usd: float = Field(2_000.0, description="Max |long| + |short|")
     max_position_pct: float = Field(0.20,   description="Max fraction of collateral in one market")
     intraday_drawdown_limit: float = Field(200.0,  description="Kill switch: loss in rolling 24h window")
+    loss_rate_limit_15m: float = Field(100.0, description="Kill switch: loss within any rolling 15-min window")
     per_trade_loss_limit: float = Field(50.0,  description="Max loss accepted before cancelling side")
     max_inventory_contracts: int  = Field(500,    description="Max contracts long or short per market")
     min_edge_bps: float = Field(15.0,  description="Minimum spread capture in bps to quote")
@@ -59,26 +52,25 @@ class HedgeProfile(BaseModel):
     hedge_size_multiplier: float = Field(0.90, description="Hedge ratio < 1 to account for basis risk")
 
 
-# ──────────────────────────────────────────────
 # Market Configuration
-# ──────────────────────────────────────────────
-
 class MarketConfig(BaseModel):
     """Per-market operational parameters."""
     condition_id: str          # Polymarket condition ID or Kalshi market ticker
     venue: Venue
     resolution_ts: int          # Unix timestamp of expected resolution
     underlying_symbol: Optional[str] = None   # e.g. "BTC" for correlated hedging
+    # Whether this market settles through the Neg Risk CTF Exchange V2
+    # (different verifyingContract for order signing). MUST be read from
+    # the market/orderbook response's `neg_risk` field , same startup
+    # resolution step as yes/no token IDs (see known gap #2 in README).
+    neg_risk: bool = False
     tick_size: float = 0.01
     min_order_size: float = 1.0  # USD notional
     risk: RiskProfile = Field(default_factory=RiskProfile)
     hedge: HedgeProfile = Field(default_factory=HedgeProfile)
 
 
-# ──────────────────────────────────────────────
 # API Credentials
-# ──────────────────────────────────────────────
-
 class PolymarketCredentials(BaseModel):
     api_key: str    = Field(default_factory=lambda: os.environ["POLY_API_KEY"])
     api_secret: str = Field(default_factory=lambda: os.environ["POLY_API_SECRET"])
@@ -98,10 +90,7 @@ class HyperliquidCredentials(BaseModel):
     private_key: str    = Field(default_factory=lambda: os.environ["HL_PRIVATE_KEY"])
 
 
-# ──────────────────────────────────────────────
 # Top-level Settings Singleton
-# ──────────────────────────────────────────────
-
 class Settings(BaseModel):
     """
     Loaded once at startup.  Treat as immutable after init.
@@ -111,8 +100,11 @@ class Settings(BaseModel):
     # Feed endpoints
     poly_ws_url: str  = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     poly_rest_url: str = "https://clob.polymarket.com"
-    kalshi_ws_url: str = "wss://trading-api.kalshi.com/trade-api/ws/v2"
-    kalshi_rest_url: str = "https://trading-api.kalshi.com/trade-api/v2"
+    # Production. For the demo/sandbox environment use:
+    #   wss://demo-api.kalshi.co/trade-api/ws/v2
+    #   https://demo-api.kalshi.co/trade-api/v2
+    kalshi_ws_url: str = "wss://api.elections.kalshi.com/trade-api/ws/v2"
+    kalshi_rest_url: str = "https://api.elections.kalshi.com/trade-api/v2"
     hl_ws_url: str    = "wss://api.hyperliquid.xyz/ws"
 
     # Credentials (lazy-loaded from env)
@@ -139,7 +131,7 @@ class Settings(BaseModel):
         return v
 
 
-# Module-level singleton — import this everywhere
+# Module-level singleton , import this everywhere
 _settings: Optional[Settings] = None
 
 
