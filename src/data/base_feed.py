@@ -1,11 +1,6 @@
 """
-src/data/base_feed.py
-─────────────────────
-Abstract async WebSocket feed with:
-  - Exponential backoff reconnection
-  - Sequence-gap detection → forced resync
-  - Latency monitoring (feed lag vs wall clock)
-  - Structured health metrics emitted to asyncio.Queue
+Base websocket feed: reconnect with backoff, detect sequence gaps and
+force a resync, track feed lag, push health metrics to a queue.
 """
 from __future__ import annotations
 
@@ -21,10 +16,7 @@ import structlog
 logger = structlog.get_logger(__name__)
 
 
-# ──────────────────────────────────────────────
 # Types
-# ──────────────────────────────────────────────
-
 class FeedStatus(str, Enum):
     CONNECTING   = "connecting"
     CONNECTED    = "connected"
@@ -55,10 +47,7 @@ class RawMessage:
     recv_wall: float   # time.time() for exchange-ts comparison
 
 
-# ──────────────────────────────────────────────
 # Base Feed
-# ──────────────────────────────────────────────
-
 class BaseFeed(ABC):
     """
     Async WebSocket feed abstraction.
@@ -94,8 +83,7 @@ class BaseFeed(ABC):
         self._ws = None
         self._log = logger.bind(venue=venue)
 
-    # ── Public API ────────────────────────────
-
+    # Public API
     async def run(self) -> None:
         """
         Main loop.  Call this as a Task.
@@ -123,12 +111,15 @@ class BaseFeed(ABC):
     def shutdown(self) -> None:
         self._shutdown.set()
 
-    # ── Abstract interface ────────────────────
-
+    # Abstract interface
     @abstractmethod
     async def _build_subscribe_msgs(self) -> list[str | bytes]:
         """Return list of subscribe payloads to send after connection."""
         ...
+
+    def _extra_ws_headers(self) -> dict:
+        """Override for venues that auth at the handshake (e.g. Kalshi's signed headers)."""
+        return {}
 
     @abstractmethod
     async def _parse_message(self, raw: RawMessage) -> AsyncIterator:
@@ -146,20 +137,29 @@ class BaseFeed(ABC):
         """Override to return exchange timestamp in ms."""
         return None
 
-    # ── Internal ─────────────────────────────
-
+    # Internal
     async def _connect_and_consume(self) -> None:
         import websockets  # local import to avoid circular
 
         self._health.status = FeedStatus.CONNECTING
         await self._emit_health()
 
-        async with websockets.connect(
-            self._url,
+        headers = self._extra_ws_headers()
+
+        # websockets >=13 renamed extra_headers -> additional_headers.
+        # TODO: just pin the version in pyproject and drop this shim
+        connect_kwargs: dict = dict(
             ping_interval=self.HEARTBEAT_INTERVAL_S,
             ping_timeout=10,
             max_size=2**23,   # 8MB frame limit
-        ) as ws:
+        )
+        if headers:
+            import inspect
+            sig = inspect.signature(websockets.connect)
+            header_kw = "additional_headers" if "additional_headers" in sig.parameters else "extra_headers"
+            connect_kwargs[header_kw] = headers
+
+        async with websockets.connect(self._url, **connect_kwargs) as ws:
             self._ws = ws
             self._health.status = FeedStatus.CONNECTED
             self._log.info("feed_connected", url=self._url)
