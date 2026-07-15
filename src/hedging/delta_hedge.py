@@ -1,41 +1,22 @@
 """
-src/hedging/delta_hedge.py
-───────────────────────────
-Cross-venue delta-neutral hedging for binary prediction market positions.
+Cross-venue delta hedging for binary prediction market positions.
 
-THEORY:
-  A prediction market YES token is economically equivalent to a
-  binary/digital option with payoff Φ(0,1).
+A YES token is basically a digital/binary option on the underlying. Delta
+w.r.t. the underlying (Black-Scholes digital option delta):
 
-  The delta of a binary option with respect to the underlying is:
-    Δ_binary = ∂P_pm / ∂S_crypto
+    delta = phi(d2) / (S * sigma * sqrt(T-t))
+    d2 = [ln(S/K) + (r - sigma^2/2)*(T-t)] / (sigma*sqrt(T-t))
 
-  Using the Black-Scholes digital option delta:
-    Δ = φ(d₂) / (S·σ·√(T-t))
+delta peaks near 0.50 when S ~= K with time left, collapses to 0 as
+resolution approaches, and blows up near the strike on a knife-edge
+binary right before expiry, don't trust it in the last few minutes.
 
-  where:
-    d₂ = [ln(S/K) + (r - σ²/2)·(T-t)] / (σ·√(T-t))
-    φ = standard normal PDF
-    S = current underlying price
-    K = strike (e.g. BTC = $100K)
-    T-t = time to resolution (years)
-    σ = implied vol of underlying
+For q YES contracts held, exposure is E_USD = q * P_pm * delta. We short
+E_USD / S_perp perp contracts on Hyperliquid to flatten it.
 
-  In practice for prediction markets:
-    - Δ is concentrated near 0.50 when S ≈ K and T-t > 0
-    - Δ → 0 as T-t → 0 (terminal resolution)
-    - Δ → ∞ near K when T-t is small (knife-edge binary)
-
-  Hedge execution:
-    If we hold q YES contracts (net long), our notional exposure is:
-      E_USD = q · P_pm · Δ_binary
-    
-    We short E_USD / S_perp perp contracts on Hyperliquid to neutralize.
-
-CORRELATION FILTER:
-  Only hedge if |ρ(ΔP_pm, ΔS_crypto)| > ρ_min over recent window.
-  Low correlation = prediction market driven by non-price factors
-  (news, fundamentals) → perp hedge would add noise, not remove it.
+We only hedge when |corr(dP_pm, dS_crypto)| clears a minimum threshold
+over the recent window. If the prediction market is moving on news/
+fundamentals rather than the underlying, hedging just adds noise.
 """
 from __future__ import annotations
 
@@ -55,10 +36,7 @@ from config.settings import HedgeProfile
 logger = structlog.get_logger(__name__)
 
 
-# ──────────────────────────────────────────────
 # Types
-# ──────────────────────────────────────────────
-
 @dataclass
 class HedgeState:
     market_id: str
@@ -80,10 +58,7 @@ class HedgeInstruction:
     reason: str         = ""
 
 
-# ──────────────────────────────────────────────
 # Correlation Tracker
-# ──────────────────────────────────────────────
-
 class CorrelationTracker:
     """
     Rolling Pearson correlation between ΔP_pm and ΔS_crypto.
@@ -140,10 +115,7 @@ class CorrelationTracker:
             q.popleft()
 
 
-# ──────────────────────────────────────────────
 # Binary Option Delta Calculator
-# ──────────────────────────────────────────────
-
 class BinaryDeltaCalc:
     """
     Computes ∂P_pm/∂S for a binary pari-mutuel prediction contract.
@@ -209,10 +181,7 @@ class BinaryDeltaCalc:
         return float(cov_xy / var_x)
 
 
-# ──────────────────────────────────────────────
 # Hedge Engine
-# ──────────────────────────────────────────────
-
 class HedgeEngine:
     """
     Determines hedge instructions from current PM inventory and correlation.
@@ -283,7 +252,7 @@ class HedgeEngine:
             self.register_market(market_id)
             state = self._states[market_id]
 
-        # ── Correlation gate ──────────────────
+        # Correlation gate
         tracker = self._corr_trackers[market_id]
         rho = tracker.correlation()
         state.last_correlation = rho
@@ -297,14 +266,14 @@ class HedgeEngine:
             )
             return None
 
-        # ── Compute delta ─────────────────────
+        # Compute delta
         T_t_years = max(0, T_res_s) / self.SECONDS_PER_YEAR
         delta = self._delta_calc.bs_digital_delta(
             S=S_perp, K=K_strike, T_t=T_t_years, sigma=sigma_perp
         )
         state.last_delta = delta
 
-        # ── Target hedge size ─────────────────
+        # Target hedge size
         #
         # Exposure = q_yes contracts × p_mid (USD if 1 contract = $1 payout)
         # Delta exposure = exposure × Δ × (K/S) (normalize to perp units)
@@ -324,9 +293,9 @@ class HedgeEngine:
         delta_hedge_needed = target_hedge_usd - current_hedge_usd
 
         if abs(delta_hedge_needed) < self._profile.min_delta_usd:
-            return None  # Below minimum threshold — skip
+            return None  # Below minimum threshold , skip
 
-        # ── Build instruction ─────────────────
+        # Build instruction
         size_contracts = abs(delta_hedge_needed) / S_perp
         side = "SELL" if delta_hedge_needed < 0 else "BUY"
 
@@ -352,8 +321,7 @@ class HedgeEngine:
 
         return instr
 
-    # ── Hyperliquid execution ─────────────────
-
+    # Hyperliquid execution
     async def execute_hedge(
         self,
         session: aiohttp.ClientSession,
@@ -390,7 +358,7 @@ class HedgeEngine:
         payload = {
             "action": order_action,
             "nonce": timestamp_ms,
-            "signature": {"r": "0x", "s": "0x", "v": 0},  # placeholder — use HL SDK
+            "signature": {"r": "0x", "s": "0x", "v": 0},  # placeholder , use HL SDK
         }
 
         url = f"{self._hl_url}/exchange"
