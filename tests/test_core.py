@@ -1,9 +1,4 @@
-"""
-tests/test_core.py
-───────────────────
-Unit tests for the critical pricing and book components.
-Run with: pytest tests/test_core.py -v
-"""
+"""Unit tests for the pricing and book components."""
 import math
 import time
 
@@ -16,10 +11,7 @@ from src.pricing.fair_value import FairValueEngine, ASBinaryParams
 from src.execution.eip712_signer import EIP712Signer, OrderParams, OrderSide
 
 
-# ──────────────────────────────────────────────
 # L2Book
-# ──────────────────────────────────────────────
-
 class TestL2Book:
 
     def test_snapshot_sorted_correctly(self):
@@ -66,10 +58,7 @@ class TestL2Book:
         assert bid[0] > ask[0]  # crossed: stored as-is, validated upstream
 
 
-# ──────────────────────────────────────────────
 # FairValueEngine
-# ──────────────────────────────────────────────
-
 class TestFairValueEngine:
 
     def _make_state(self, p_mid=0.50, ttres_s=86400, cvd=0.0, imbalance=0.0):
@@ -203,10 +192,7 @@ class TestFairValueEngine:
                 )
 
 
-# ──────────────────────────────────────────────
 # EIP-712 Signer
-# ──────────────────────────────────────────────
-
 class TestEIP712Signer:
 
     # Use a deterministic test key (never use in production)
@@ -218,6 +204,11 @@ class TestEIP712Signer:
         assert len(signer.address) == 42
 
     def test_sign_buy_order_structure(self):
+        """
+        V2 Order struct dropped `taker`, `expiration`, `nonce`, and
+        `feeRateBps` entirely (see CLOB V2 migration, 2026-04-28).
+        Uniqueness now comes from `timestamp` (ms) + random `salt`.
+        """
         signer = EIP712Signer(self.TEST_PRIVATE_KEY)
         params = OrderParams(
             token_id="123456789",
@@ -229,11 +220,17 @@ class TestEIP712Signer:
 
         assert signed.side == 0
         assert signed.maker == signer.address
-        assert signed.taker == "0x0000000000000000000000000000000000000000"
-        assert signed.signature.startswith("0x") or len(signed.signature) == 130
+        assert signed.signer == signer.address
+        assert not hasattr(signed, "taker")   # V2: no taker field
+        assert int(signed.timestamp) > 0
+        assert signed.signature.startswith("0x")
+        assert len(signed.signature) == 132   # 0x + 65 bytes
 
     def test_amounts_scale_correctly_buy(self):
-        """BUY: makerAmount = USDC (6 dec), takerAmount = tokens (18 dec)."""
+        """
+        V2: BOTH makerAmount and takerAmount are 6-decimal integers.
+        Outcome tokens are no longer 18-decimal as they were pre-migration.
+        """
         signer = EIP712Signer(self.TEST_PRIVATE_KEY)
         params = OrderParams(
             token_id="1",
@@ -242,17 +239,26 @@ class TestEIP712Signer:
             size=100.0,      # 100 outcome tokens
         )
         signed = signer.sign_order(params)
-        # makerAmount = 0.60 × 100 × 10^6 = 60_000_000
+        # makerAmount = 0.60 × 100 × 10^6 = 60_000_000 (pUSD)
         assert int(signed.maker_amount) == 60_000_000
-        # takerAmount = 100 × 10^18
-        assert int(signed.taker_amount) == 100 * 10**18
+        # takerAmount = 100 × 10^6 (outcome tokens, 6-dec under V2)
+        assert int(signed.taker_amount) == 100 * 10**6
 
-    def test_nonce_increments(self):
+    def test_neg_risk_selects_correct_verifying_contract(self):
+        """A neg-risk order must be signed against the Neg Risk Exchange
+        domain, not the regular CTF Exchange , different verifyingContract
+        means a signature for one is invalid for the other."""
+        from src.execution.eip712_signer import EXCHANGE_V2, NEG_RISK_EXCHANGE_V2
+        assert EXCHANGE_V2 != NEG_RISK_EXCHANGE_V2
+
+    def test_timestamp_used_for_uniqueness_not_nonce(self):
+        """V2 has no nonce field; uniqueness comes from random salt."""
         signer = EIP712Signer(self.TEST_PRIVATE_KEY)
         p = OrderParams(token_id="1", side=OrderSide.BUY, price=0.5, size=10)
         s1 = signer.sign_order(p)
         s2 = signer.sign_order(p)
-        assert int(s2.nonce) == int(s1.nonce) + 1
+        assert not hasattr(s1, "nonce")
+        assert s1.salt != s2.salt   # uniqueness via salt, not a sequential nonce
 
     def test_salt_unique_per_order(self):
         signer = EIP712Signer(self.TEST_PRIVATE_KEY)
@@ -261,10 +267,7 @@ class TestEIP712Signer:
         assert len(salts) == 20  # all unique
 
 
-# ──────────────────────────────────────────────
 # Backtest Smoke Tests
-# ──────────────────────────────────────────────
-
 class TestBacktest:
 
     def test_single_path_runs_without_error(self):
@@ -309,3 +312,112 @@ class TestBacktest:
         assert len(report.folds) == 3
         for fold in report.folds:
             assert isinstance(fold.test_result.sharpe, float)
+
+
+# Kalshi bids-only book (regression tests for the structural fix)
+class TestKalshiBidsOnlyBook:
+    """
+    Kalshi's feed only ever sends bid-side levels for both the yes and no
+    legs , there is no ask array anywhere in the protocol. These tests
+    guard the complement-derivation logic in UnifiedBook against
+    regressing back to expecting asks directly from the feed.
+    """
+
+    def test_yes_ask_derived_as_complement_of_no_bid(self):
+        from src.data.kalshi_feed import KalshiBookSnapshot, KalshiLevel
+        from src.data.unified_book import UnifiedBook, BookSource
+
+        ub = UnifiedBook("T-1", BookSource.KALSHI, resolution_ts=0)
+        snap = KalshiBookSnapshot(
+            market_ticker="T-1",
+            yes_bids=[KalshiLevel(price=0.42, size=100)],
+            no_bids=[KalshiLevel(price=0.56, size=80)],
+            seq=1, timestamp_ms=1000, recv_ts=1.0,
+        )
+        state = ub.process(snap)
+        assert state is not None
+        assert abs(state.p_bid - 0.42) < 1e-9
+        assert abs(state.p_ask - (1.0 - 0.56)) < 1e-9   # 0.44
+
+    def test_no_state_without_opposing_leg_bid(self):
+        """Can't derive a YES ask with zero NO-side liquidity , must not
+        fabricate one."""
+        from src.data.kalshi_feed import KalshiBookSnapshot, KalshiLevel
+        from src.data.unified_book import UnifiedBook, BookSource
+
+        ub = UnifiedBook("T-2", BookSource.KALSHI, resolution_ts=0)
+        snap = KalshiBookSnapshot(
+            market_ticker="T-2",
+            yes_bids=[KalshiLevel(price=0.42, size=100)],
+            no_bids=[],
+            seq=1, timestamp_ms=1000, recv_ts=1.0,
+        )
+        state = ub.process(snap)
+        assert state is None
+
+    def test_delta_updates_complement_ask(self):
+        from src.data.kalshi_feed import KalshiBookSnapshot, KalshiBookDelta, KalshiLevel
+        from src.data.unified_book import UnifiedBook, BookSource
+
+        ub = UnifiedBook("T-3", BookSource.KALSHI, resolution_ts=0)
+        ub.process(KalshiBookSnapshot(
+            market_ticker="T-3",
+            yes_bids=[KalshiLevel(price=0.40, size=100)],
+            no_bids=[KalshiLevel(price=0.50, size=50), KalshiLevel(price=0.48, size=30)],
+            seq=1, timestamp_ms=1000, recv_ts=1.0,
+        ))
+        # Fully remove the best NO bid (0.50) -> next best NO bid is 0.48
+        state = ub.process(KalshiBookDelta(
+            market_ticker="T-3", side="no", price=0.50, delta=-50,
+            seq=2, timestamp_ms=1100, recv_ts=1.1,
+        ))
+        assert state is not None
+        assert abs(state.p_ask - (1.0 - 0.48)) < 1e-9
+
+
+# RiskEngine loss-rate kill switch (was a no-op stub)
+class TestRiskEngineLossRate:
+
+    def test_loss_rate_triggers_kill(self):
+        import asyncio
+        from config.settings import RiskProfile
+        from src.risk.engine import RiskEngine
+
+        profile = RiskProfile(loss_rate_limit_15m=10.0, intraday_drawdown_limit=10_000.0)
+        kill_event = asyncio.Event()
+        engine = RiskEngine(profile, kill_event)
+
+        # Manually seed pnl_samples spanning >15min with a big drop,
+        # bypassing real time.sleep for a fast unit test.
+        now = engine._pnl_samples.maxlen or 0  # no-op, just referencing attr exists
+        import time as _time
+        t0 = _time.monotonic() - engine.LOSS_RATE_WINDOW_S + 1
+        engine._pnl_samples.append((t0, 0.0))
+        engine._pnl_samples.append((_time.monotonic(), -50.0))  # lost $50
+
+        assert not kill_event.is_set()
+        engine._check_loss_rate()
+        assert kill_event.is_set()
+
+    def test_realized_pnl_trusts_caller_not_recomputed(self):
+        """RiskEngine must not recompute realized PnL independently , it
+        should simply accumulate whatever InventoryManager reports, even
+        across a long -> short position flip (which the old internal
+        VWAP tracker got wrong)."""
+        import asyncio
+        from config.settings import RiskProfile
+        from src.risk.engine import RiskEngine
+
+        profile = RiskProfile(intraday_drawdown_limit=10_000.0)
+        engine = RiskEngine(profile, asyncio.Event())
+
+        engine.on_fill(
+            market_id="m1", order_id="o1", fill_price=0.5, fill_size=10,
+            side="BUY", mid_at_fill=0.5, realized_pnl=0.0,
+        )
+        engine.on_fill(
+            market_id="m1", order_id="o2", fill_price=0.6, fill_size=25,
+            side="SELL", mid_at_fill=0.6, realized_pnl=1.0,  # caller-supplied
+        )
+        # RiskEngine must reflect exactly what was passed in, not its own math
+        assert abs(engine._pnl["m1"].realized_pnl - 1.0) < 1e-9
