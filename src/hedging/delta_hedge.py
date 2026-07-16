@@ -325,11 +325,34 @@ class HedgeEngine:
         return instr
 
     # Hyperliquid execution
+    def _crossing_slippage(self, sigma_perp: Optional[float]) -> float:
+        """
+        IOC crossing buffer as a fraction of price, scaled by how far
+        the perp could realistically move in the time it takes the
+        order to fill. sigma_perp is annualized, we only care about the
+        max_hedge_latency_ms window, so scale down by sqrt(time), the
+        usual square-root-of-time rule for diffusive vol.
+
+        Used to be a flat 0.5% regardless of market conditions, too
+        wide in a quiet market (paying away edge for nothing), too
+        tight in a fast one (IOC just doesn't fill and we stay exposed).
+        """
+        if not sigma_perp or sigma_perp <= 0:
+            return self._profile.min_slip_bps / 10_000
+
+        dt_years = (self._profile.max_hedge_latency_ms / 1000.0) / (365.25 * 24 * 3600)
+        raw_slip = self._profile.slip_vol_multiplier * sigma_perp * math.sqrt(dt_years)
+
+        floor = self._profile.min_slip_bps / 10_000
+        ceiling = self._profile.max_slip_bps / 10_000
+        return min(max(raw_slip, floor), ceiling)
+
     async def execute_hedge(
         self,
         session: aiohttp.ClientSession,
         instr: HedgeInstruction,
         S_perp: float,
+        sigma_perp: Optional[float] = None,
     ) -> bool:
         """Submit an IOC order to Hyperliquid to move the hedge toward target."""
         coin = instr.symbol.removesuffix("-PERP")
@@ -344,9 +367,8 @@ class HedgeEngine:
             return False
 
         is_buy = instr.side == "BUY"
-        # cross the spread on purpose, this is a hedge, not a passive quote,
-        # a few bps of slip beats being unhedged for another quoting cycle
-        limit_price = round(S_perp * (1.005 if is_buy else 0.995), 1)
+        slip = self._crossing_slippage(sigma_perp)
+        limit_price = round(S_perp * (1 + slip if is_buy else 1 - slip), 1)
 
         order_action = {
             "type": "order",
