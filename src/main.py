@@ -31,6 +31,7 @@ from src.execution.order_types import FlickeringFilter
 from src.execution.polymarket_auth import PolyL2Auth, PolyL2Credentials
 from src.execution.kalshi_auth import KalshiRsaSigner
 from src.execution.kalshi_order_manager import KalshiOrderManager
+from src.execution.reconciliation import StartupReconciler
 from src.hedging.delta_hedge import HedgeEngine
 from src.hedging.hyperliquid_signer import HyperliquidSigner
 from src.hedging.hyperliquid_price_feed import HyperliquidPriceFeed
@@ -129,6 +130,10 @@ class Orchestrator:
             mid for mid, mconf in self._cfg.markets.items()
             if mconf.venue == Venue.POLYMARKET
         ]
+        kalshi_market_ids = [
+            mid for mid, mconf in self._cfg.markets.items()
+            if mconf.venue == Venue.KALSHI
+        ]
         if poly_market_ids and poly_creds:
             resolver = PolymarketMarketResolver(self._cfg.poly_rest_url, self._http_session)
             for mid in poly_market_ids:
@@ -184,6 +189,34 @@ class Orchestrator:
             risk_profile=next(iter(self._cfg.markets.values())).risk,
             kill_event=self._kill_event,
         )
+
+        # Startup reconciliation: pull real positions and flatten any
+        # resting orders left over from a previous run. Skipping this
+        # means InventoryManager starts at zero while the exchange might
+        # be holding a real position, and any pre-existing order sits
+        # there un-tracked until it fills or someone cancels it by hand.
+        reconciler = StartupReconciler(self._http_session)
+
+        if poly_market_ids and poly_creds:
+            poly_positions = await reconciler.reconcile_polymarket(
+                wallet_address=self._signer.address,
+                data_api_url=self._cfg.poly_data_api_url,
+                clob_rest_url=self._cfg.poly_rest_url,
+                l2_auth=l2_auth,
+                condition_to_mid=self._condition_to_mid,
+            )
+            for pos in poly_positions:
+                self._inventory_mgr.seed_position(pos.market_id, pos.net_qty, pos.avg_entry)
+
+        if kalshi_market_ids and self._cfg.kalshi:
+            kalshi_positions = await reconciler.reconcile_kalshi(
+                rest_url=self._cfg.kalshi_rest_url,
+                api_key_id=self._cfg.kalshi.api_key_id,
+                rsa_signer=KalshiRsaSigner(self._cfg.kalshi.private_key_pem),
+                ticker_to_mid=self._condition_to_mid,
+            )
+            for pos in kalshi_positions:
+                self._inventory_mgr.seed_position(pos.market_id, pos.net_qty, pos.avg_entry)
 
         # Hedge engine
         if hl_creds:
@@ -429,6 +462,7 @@ class Orchestrator:
                         inventory_q=self._inventory_mgr.get_net_qty(mid_id),
                         order_size_usd=mconf.risk.min_edge_bps * 10,  # size proportional to edge
                         neg_risk=resolved.neg_risk,
+                        tick_size=resolved.tick_size,
                     )
                 elif self._kalshi_order_manager:
                     await self._kalshi_order_manager.update_quotes(
