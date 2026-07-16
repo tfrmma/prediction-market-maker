@@ -18,7 +18,6 @@ and diff it against a live capture before trusting it in prod.
 """
 from __future__ import annotations
 
-import base64
 import json
 import time
 from dataclasses import dataclass
@@ -27,6 +26,7 @@ from typing import AsyncIterator, Dict, List, Optional
 import structlog
 
 from src.data.base_feed import BaseFeed, RawMessage
+from src.execution.kalshi_auth import KalshiRsaSigner
 
 logger = structlog.get_logger(__name__)
 
@@ -86,11 +86,33 @@ class KalshiTicker:
     recv_ts: float
 
 
+@dataclass
+class KalshiOwnFill:
+    """One of OUR OWN fills, from the authenticated "fill" channel.
+
+    We only ever place orders on the yes side of the book (BookSide
+    bid/ask maps straight to buy/sell YES on the V2 order endpoint), so
+    side should always be "yes" here. If it ever shows up as "no" that
+    means an order got routed some other way, current code doesn't
+    handle that case, it just logs a warning and skips it.
+    """
+    market_ticker: str
+    order_id: str
+    trade_id: str
+    is_taker: bool
+    yes_side: bool     # side == "yes"
+    yes_price: float   # dollars, always YES-denominated
+    count: float
+    action: str        # "buy" | "sell"
+    timestamp_ms: int
+    recv_ts: float
+
+
 # Feed
 class KalshiFeed(BaseFeed):
     """
     Kalshi WS feed.  Emits:
-      KalshiBookSnapshot | KalshiBookDelta | KalshiTrade | KalshiTicker
+      KalshiBookSnapshot | KalshiBookDelta | KalshiTrade | KalshiTicker | KalshiOwnFill
     """
 
     STALE_FEED_TIMEOUT_S = 12.0
@@ -108,25 +130,11 @@ class KalshiFeed(BaseFeed):
         super().__init__(ws_url, "kalshi", out_queue, health_queue)
         self._tickers        = tickers
         self._api_key_id     = api_key_id
-        self._private_key    = self._load_rsa_key(private_key_pem)
+        self._rsa            = KalshiRsaSigner(private_key_pem)
         self._cmd_id         = 0
         self._seq_by_market: Dict[str, int] = {}
         self._log = logger.bind(venue="kalshi", n_markets=len(tickers))
 
-    # BaseFeed interface
-    def _extra_ws_headers(self) -> dict:
-        """
-        Kalshi authenticates the WS *handshake* via signed HTTP headers,
-        not via an in-band message. Timestamp must be fresh, so this is
-        computed on every (re)connect.
-        """
-        ts_ms = int(time.time() * 1000)
-        sig = self._sign_rsa(ts_ms, "GET", self.WS_AUTH_PATH)
-        return {
-            "KALSHI-ACCESS-KEY": self._api_key_id,
-            "KALSHI-ACCESS-SIGNATURE": sig,
-            "KALSHI-ACCESS-TIMESTAMP": str(ts_ms),
-        }
 
     async def _build_subscribe_msgs(self) -> list:
         """
@@ -137,7 +145,7 @@ class KalshiFeed(BaseFeed):
             "id": self._next_cmd_id(),
             "cmd": "subscribe",
             "params": {
-                "channels": ["orderbook_delta", "ticker", "trade"],
+                "channels": ["orderbook_delta", "ticker", "trade", "fill"],
                 "market_tickers": self._tickers,
             },
         }
@@ -167,6 +175,10 @@ class KalshiFeed(BaseFeed):
 
         elif msg_type == "ticker":
             for ev in self._parse_ticker(data, raw.recv_ts):
+                yield ev
+
+        elif msg_type == "fill":
+            for ev in self._parse_own_fill(data, raw.recv_ts):
                 yield ev
 
         elif msg_type in ("subscribed", "ok"):
@@ -339,39 +351,39 @@ class KalshiFeed(BaseFeed):
         except (KeyError, ValueError) as exc:
             self._log.warning("bad_ticker", error=str(exc))
 
+    def _parse_own_fill(self, data: dict, recv_ts: float):
+        ticker = data.get("market_ticker")
+        if ticker not in self._tickers:
+            return
+        side = str(data.get("side", "")).lower()
+        if side != "yes":
+            self._log.warning("fill_on_no_side_unsupported", ticker=ticker, side=side)
+            return
+        try:
+            yield KalshiOwnFill(
+                market_ticker=ticker,
+                order_id=str(data.get("order_id", "")),
+                trade_id=str(data.get("trade_id", "")),
+                is_taker=bool(data.get("is_taker", False)),
+                yes_side=True,
+                yes_price=float(data.get("yes_price_dollars", 0)),
+                count=float(data.get("count_fp", 0)),
+                action=str(data.get("action", "")).lower(),
+                timestamp_ms=int(data.get("ts_ms", data.get("ts", 0)) or 0),
+                recv_ts=recv_ts,
+            )
+        except (KeyError, ValueError) as exc:
+            self._log.warning("bad_own_fill", error=str(exc))
+
     # Auth
-    @staticmethod
-    def _load_rsa_key(pem: str):
-        """Load RSA private key from PEM string."""
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.backends import default_backend
-        return serialization.load_pem_private_key(
-            pem.encode(),
-            password=None,
-            backend=default_backend(),
-        )
-
-    def _sign_rsa(self, timestamp_ms: int, method: str, path: str) -> str:
+    def _extra_ws_headers(self) -> dict:
         """
-        Kalshi v2 auth: RSA-PSS SHA-256 over (timestamp_ms + method + path).
-        salt_length = digest size (32 bytes), per docs.kalshi.com's own
-        quick-start example , NOT PSS.MAX_LENGTH, which some third-party
-        guides use inconsistently and can fail signature verification.
-        Returns base64-encoded signature.
+        Kalshi authenticates the WS *handshake* via signed HTTP headers,
+        not via an in-band message. Timestamp must be fresh, so this is
+        computed on every (re)connect.
         """
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.asymmetric import padding
-
-        msg = f"{timestamp_ms}{method}{path}".encode()
-        sig = self._private_key.sign(
-            msg,
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=hashes.SHA256().digest_size,
-            ),
-            hashes.SHA256(),
-        )
-        return base64.b64encode(sig).decode()
+        ts_ms = int(time.time() * 1000)
+        return self._rsa.headers(self._api_key_id, ts_ms, "GET", self.WS_AUTH_PATH)
 
     def _next_cmd_id(self) -> int:
         self._cmd_id += 1
