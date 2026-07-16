@@ -100,6 +100,7 @@ class Settings(BaseModel):
     # Feed endpoints
     poly_ws_url: str  = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     poly_rest_url: str = "https://clob.polymarket.com"
+    poly_data_api_url: str = "https://data-api.polymarket.com"   # positions, public, no auth
     # Production. For the demo/sandbox environment use:
     #   wss://demo-api.kalshi.co/trade-api/ws/v2
     #   https://demo-api.kalshi.co/trade-api/v2
