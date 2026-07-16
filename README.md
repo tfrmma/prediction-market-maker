@@ -1,4 +1,4 @@
-# Prediction Market - Market Maker
+# Prediction Market Market Maker
 
 Algorithmic market making engine for binary prediction markets. Targets **Polymarket CLOB (V2)** and **Kalshi**, with delta-neutral hedging via **Hyperliquid** perpetuals.
 
@@ -45,7 +45,8 @@ This is a real trading system, not a demo. It signs and submits live orders, tra
 ```
 prediction-market-maker/
 ├── config/
-│   └── settings.py                    # Pydantic settings: risk profiles, API creds, market configs
+│   ├── settings.py                    # Pydantic settings: risk profiles, API creds, market configs
+│   └── secrets.py                     # Secret loading: AWS Secrets Manager, falls back to env vars
 ├── src/
 │   ├── data/
 │   │   ├── base_feed.py               # Abstract WS feed: reconnection, gap detection, staleness
@@ -54,7 +55,8 @@ prediction-market-maker/
 │   │   ├── kalshi_feed.py             # Kalshi API v2 connector (RSA-PSS auth, seq tracking, own fills)
 │   │   └── unified_book.py            # YES/NO synthetic probability matrix, OFI, CVD
 │   ├── pricing/
-│   │   └── fair_value.py              # A-S binary adaptation, Prelec correction, OLS calibrator
+│   │   ├── fair_value.py              # A-S binary adaptation, Prelec correction, OLS calibrator
+│   │   └── sizing.py                  # Order sizing: edge/vol/free-collateral bounded
 │   ├── execution/
 │   │   ├── eip712_signer.py           # EIP-712 signing for Polymarket CLOB V2 orders
 │   │   ├── polymarket_auth.py         # L2 HMAC auth for authenticated CLOB REST calls
@@ -171,7 +173,7 @@ Realized PnL is computed once, by `InventoryManager`, and passed down to `RiskEn
 
 ```bash
 # Python 3.11+
-git clone https://github.com/tfrmma/prediction-market-maker.git
+git clone <this repo>
 cd prediction-market-maker
 
 pip install -e ".[test]"
@@ -191,6 +193,9 @@ export POLY_PRIVATE_KEY="0x..."      # Polygon wallet private key
 # Kalshi
 export KALSHI_KEY_ID="..."
 export KALSHI_PEM="-----BEGIN PRIVATE KEY-----\n..."
+# optional: source the PEM from AWS Secrets Manager instead of the
+# plaintext env var above (requires boto3)
+export KALSHI_PEM_SECRET_ARN="arn:aws:secretsmanager:...:secret:kalshi-pem"
 
 # Hyperliquid (hedging)
 export HL_WALLET="0x..."
@@ -235,9 +240,13 @@ Note that YES/NO token ids, `neg_risk`, and tick size are **not** configured man
 | `per_trade_loss_limit` | 50 | Cancel side after this loss |
 | `max_inventory_contracts` | 500 | Hard inventory ceiling |
 | `min_edge_bps` | 15 | Don't quote below 15 bps edge |
+| `base_order_size_usd` | 25 | Order size at min_edge_bps / average vol |
+| `max_order_size_usd` | 150 | Hard ceiling regardless of edge/vol scaling |
 | `toxic_flow_pause_ms` | 5 000 | Quote freeze after toxicity trigger |
 | `flickering_window_ms` | 500 | Window for cancel pattern detection |
 | `flickering_cancel_threshold` | 3 | Cancels in window triggers a freeze |
+
+Order size scales up with edge (capped at 3x `base_order_size_usd`), down with `realized_vol_1m` (capped at 2x), and is always bounded by `max_position_pct * free_collateral` and `max_order_size_usd`, whichever is smaller. See `src/pricing/sizing.py`.
 
 ## Running
 
@@ -292,7 +301,7 @@ pytest tests/test_core.py -v
 pytest tests/test_core.py --cov=src --cov-report=term-missing
 ```
 
-34 tests across ten classes:
+43 tests across thirteen classes:
 
 | Class | What it covers |
 |---|---|
@@ -306,6 +315,9 @@ pytest tests/test_core.py --cov=src --cov-report=term-missing
 | `TestPolymarketMarketResolver` | YES/NO token id extraction from the `/markets/{condition_id}` response shape |
 | `TestKalshiOrderManagerWireFormat` | BUY/SELL to bid/ask side mapping |
 | `TestRoundToTick` | Price snapping to the resolved tick size |
+| `TestOrderSizing` | Zero-edge floor, free-collateral budget cap, hard ceiling, vol dampening |
+| `TestHedgeSlippage` | No-data floor fallback, vol widens the crossing buffer, ceiling clamp |
+| `TestSecretsLoader` | Plain env var fallback, AWS Secrets Manager path when an ARN is configured |
 
 ## Kill switch
 
@@ -333,16 +345,14 @@ If the process restarts with resting orders still live on either exchange, start
 
 ## Known gaps
 
-Closed as of this revision: Polymarket CLOB V2 order signing (real 6-decimal amounts, correct domain, neg-risk contract routing), the L2 HMAC auth that requests previously went out without, Kalshi's bids-only order book (was being parsed as if it had a real ask side), a working Kalshi execution engine (order placement, cancellation, own-fill feed, none of which existed before), real Hyperliquid phantom-agent signing (was a placeholder `{r, s, v}` that never worked), a live Hyperliquid price/vol feed for the hedge engine (was a hardcoded constant), the own-fill feedback loop on both venues, post-only and tick-size rounding on both venues, a symmetric self-trade guard, and startup reconciliation.
+Closed as of this revision: Polymarket CLOB V2 order signing (real 6-decimal amounts, correct domain, neg-risk contract routing), the L2 HMAC auth that requests previously went out without, Kalshi's bids-only order book (was being parsed as if it had a real ask side), a working Kalshi execution engine (order placement, cancellation, own-fill feed, none of which existed before), real Hyperliquid phantom-agent signing (was a placeholder `{r, s, v}` that never worked), a live Hyperliquid price/vol feed for the hedge engine (was a hardcoded constant), the own-fill feedback loop on both venues, post-only and tick-size rounding on both venues, a symmetric self-trade guard, startup reconciliation, real order sizing tied to edge/vol/free collateral (was `min_edge_bps * 10`), a drained `health_queue` with degradation logging, Kalshi's PEM sourced from a secrets manager when configured (falls back to env var otherwise), and hedge crossing slippage scaled to realized vol instead of a flat 0.5%.
 
 Still open:
 
-- **Order sizing is a placeholder heuristic.** `order_size_usd = risk.min_edge_bps * 10` has no real relationship to edge, volatility, or available capital. Needs a real sizing model.
-- **`health_queue` is populated but never consumed.** Feed and hedge health metrics (lag, reconnects) are emitted into a queue in `main.py` that nothing currently drains, so a silently degrading feed won't surface until something downstream breaks.
-- **Kalshi PEM loaded from an environment variable.** Should come from a proper secrets manager in production.
-- **Hedge execution uses a fixed 0.5% slippage allowance.** Should scale with the realized vol `HyperliquidPriceFeed` already computes, instead of a flat constant.
 - **No integration testing against live sandboxes.** Everything above is validated at the unit level with mocks. None of it has been run against Kalshi's demo environment, Hyperliquid testnet, or Polymarket with real size.
 - **`ManagedOrder.status` never transitions `PENDING -> OPEN`.** Doesn't break anything today, but any future logic that branches on that distinction will be wrong.
+- **Order sizing is a linear heuristic, not a proper bankroll model.** It's now bounded by edge, vol, and free collateral rather than being a constant, but it's still not Kelly-sized or aware of cross-market correlation.
+- **`_health_monitor` logs, it doesn't act.** A feed staying disconnected or laggy for an extended period gets logged loudly but doesn't itself trigger the kill switch, that's still `RiskEngine`'s book-staleness check on a different, coarser timescale.
 
 ## Design decisions
 
