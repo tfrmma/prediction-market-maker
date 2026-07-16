@@ -20,7 +20,7 @@ import structlog
 from config.settings import RiskProfile
 from src.data.unified_book import MarketState
 from src.execution.eip712_signer import EIP712Signer, OrderParams, OrderSide, SignedOrder
-from src.execution.order_types import FlickeringFilter, ManagedOrder, OrderSideStr, OrderStatus
+from src.execution.order_types import FlickeringFilter, ManagedOrder, OrderSideStr, OrderStatus, round_to_tick
 from src.execution.polymarket_auth import PolyL2Auth
 from src.pricing.fair_value import FairValueResult
 
@@ -73,6 +73,7 @@ class OrderManager:
         inventory_q: float,
         order_size_usd: float = 50.0,
         neg_risk: bool = False,
+        tick_size: float = 0.01,
     ) -> None:
         """
         Compare current live quotes against FairValueResult.
@@ -95,17 +96,23 @@ class OrderManager:
             ("BUY",  fv.bid_quote),
             ("SELL", fv.ask_quote),
         ]:
-            # Self-trade prevention: if we have a matching ask already placed,
-            # don't place a bid above it (shouldn't happen, but guard anyway)
+            # Self-trade prevention: don't let our own bid cross our own
+            # ask, in either direction, shouldn't happen given how fv
+            # is computed but the cost of checking is one comparison
             opposite = "SELL" if side_str == "BUY" else "BUY"
             opp_order = self._live.get((market_id, opposite))
             if opp_order and opp_order.status == OrderStatus.OPEN:
-                if side_str == "BUY" and quote_price >= opp_order.price:
+                crosses = (
+                    (side_str == "BUY"  and quote_price >= opp_order.price) or
+                    (side_str == "SELL" and quote_price <= opp_order.price)
+                )
+                if crosses:
                     self._log.warning(
                         "stp_guard",
                         market_id=market_id,
-                        bid=quote_price,
-                        ask=opp_order.price,
+                        side=side_str,
+                        quote_price=quote_price,
+                        opposite_price=opp_order.price,
                     )
                     continue
 
@@ -122,6 +129,7 @@ class OrderManager:
                 yes_token_id=yes_token_id,
                 order_size_usd=order_size_usd,
                 neg_risk=neg_risk,
+                tick_size=tick_size,
             )
 
     async def _update_side(
@@ -133,6 +141,7 @@ class OrderManager:
         yes_token_id: str,
         order_size_usd: float,
         neg_risk: bool = False,
+        tick_size: float = 0.01,
     ) -> None:
         key = (market_id, side_str)
         live = self._live.get(key)
@@ -140,7 +149,8 @@ class OrderManager:
         if live is None or live.status not in (OrderStatus.OPEN, OrderStatus.PENDING):
             # No live order , place new
             await self._place_order(
-                market_id, side_str, quote_price, yes_token_id, order_size_usd
+                market_id, side_str, quote_price, yes_token_id, order_size_usd,
+                neg_risk=neg_risk, tick_size=tick_size,
             )
             return
 
@@ -167,7 +177,7 @@ class OrderManager:
         if cancelled:
             await self._place_order(
                 market_id, side_str, quote_price, yes_token_id, order_size_usd,
-                neg_risk=neg_risk,
+                neg_risk=neg_risk, tick_size=tick_size,
             )
 
     # Order operations
@@ -185,13 +195,14 @@ class OrderManager:
         token_id: str,
         size_usd: float,
         neg_risk: bool = False,
+        tick_size: float = 0.01,
     ) -> Optional[ManagedOrder]:
-        """
-        Build, sign, and submit a POST-ONLY limit order.
-        """
+        """Build, sign, and submit a post-only limit order."""
+        price = round_to_tick(price, tick_size)
+
         # Derive contract size from USD notional
-        # size (contracts) ≈ size_usd / price   [USD / (USD/contract)]
-        n_contracts = size_usd / max(price, 0.01)
+        # size (contracts) ~= size_usd / price   [USD / (USD/contract)]
+        n_contracts = size_usd / max(price, tick_size)
 
         side = OrderSide.BUY if side_str == "BUY" else OrderSide.SELL
         params = OrderParams(
@@ -209,7 +220,12 @@ class OrderManager:
             return None
 
         payload = signed.to_api_dict()
-        payload["orderType"] = "GTC"   # Good-til-cancel; CLOB enforces post-only at contract level
+        payload["orderType"] = "GTC"
+        # postOnly is a real wire-body flag, not something the exchange
+        # infers, rejects instead of executing if the order would cross
+        # and take liquidity. Without this a "maker" order can silently
+        # execute as taker and eat the taker fee.
+        payload["postOnly"] = True
 
         url = f"{self._rest_url}/order"
         body_str = json.dumps(payload, separators=(",", ":"))
