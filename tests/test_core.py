@@ -524,3 +524,102 @@ class TestRoundToTick:
     def test_already_on_tick_unchanged(self):
         from src.execution.order_types import round_to_tick
         assert round_to_tick(0.56, 0.01) == 0.56
+
+
+class TestOrderSizing:
+    """order_size_usd used to be min_edge_bps * 10, no relationship to
+    risk, vol, or actual capital. These pin down the bounds it's now
+    supposed to respect."""
+
+    def _profile(self, **overrides):
+        from config.settings import RiskProfile
+        defaults = dict(base_order_size_usd=25.0, max_order_size_usd=150.0,
+                         min_edge_bps=15.0, max_position_pct=0.20)
+        defaults.update(overrides)
+        return RiskProfile(**defaults)
+
+    def test_zero_edge_sizes_to_zero(self):
+        from src.pricing.sizing import compute_order_size_usd
+        size = compute_order_size_usd(edge_bps=0, sigma=0.1, free_collateral_usd=1000, risk_profile=self._profile())
+        assert size == 0.0
+
+    def test_never_exceeds_free_collateral_budget(self):
+        from src.pricing.sizing import compute_order_size_usd
+        profile = self._profile(max_position_pct=0.10, max_order_size_usd=1_000_000)
+        size = compute_order_size_usd(edge_bps=200, sigma=0.01, free_collateral_usd=100, risk_profile=profile)
+        assert size <= 10.0 + 1e-9   # 10% of $100
+
+    def test_never_exceeds_hard_ceiling(self):
+        from src.pricing.sizing import compute_order_size_usd
+        profile = self._profile(max_order_size_usd=40.0)
+        size = compute_order_size_usd(edge_bps=1000, sigma=0.001, free_collateral_usd=1_000_000, risk_profile=profile)
+        assert size <= 40.0 + 1e-9
+
+    def test_higher_vol_reduces_size(self):
+        from src.pricing.sizing import compute_order_size_usd
+        profile = self._profile(max_order_size_usd=1_000_000, max_position_pct=1.0)
+        # both above the 1/0.02=50x floor-clamp and below the 2.0x
+        # ceiling-clamp on vol_factor, so the comparison actually
+        # exercises the 1/sigma scaling instead of the clamps
+        calm = compute_order_size_usd(edge_bps=30, sigma=0.6, free_collateral_usd=10_000, risk_profile=profile)
+        choppy = compute_order_size_usd(edge_bps=30, sigma=1.5, free_collateral_usd=10_000, risk_profile=profile)
+        assert choppy < calm
+
+
+class TestHedgeSlippage:
+    """Was a flat 0.5% regardless of market conditions, now scales with
+    realized vol and is bounded on both ends."""
+
+    def _engine(self, **overrides):
+        from config.settings import HedgeProfile
+        from src.hedging.delta_hedge import HedgeEngine
+        defaults = dict(min_slip_bps=10.0, max_slip_bps=200.0,
+                         slip_vol_multiplier=4.0, max_hedge_latency_ms=200)
+        defaults.update(overrides)
+        profile = HedgeProfile(**defaults)
+        return HedgeEngine(profile, "https://api.hyperliquid.xyz", signer=None,
+                            asset_index_fn=lambda c: 0, sz_decimals_fn=lambda c: 3)
+
+    def test_no_vol_data_falls_back_to_floor(self):
+        engine = self._engine()
+        assert engine._crossing_slippage(None) == 10.0 / 10_000
+
+    def test_higher_vol_widens_slippage(self):
+        engine = self._engine()
+        # picked so both land strictly between floor and ceiling, otherwise
+        # the clamps do the comparison's job instead of the scaling math
+        low = engine._crossing_slippage(20.0)
+        high = engine._crossing_slippage(60.0)
+        assert high > low
+
+    def test_respects_ceiling(self):
+        engine = self._engine(max_slip_bps=50.0)
+        slip = engine._crossing_slippage(500.0)   # absurd vol
+        assert slip <= 50.0 / 10_000 + 1e-12
+
+
+class TestSecretsLoader:
+    """Kalshi's PEM used to come straight out of a plaintext env var
+    with no alternative. This checks the fallback path stays honest
+    about doing that, and that the AWS path isn't silently skipped."""
+
+    def test_falls_back_to_env_var_when_no_arn_configured(self, monkeypatch):
+        from config.secrets import load_secret
+        monkeypatch.setenv("TEST_SECRET_PLAIN", "shh")
+        monkeypatch.delenv("TEST_SECRET_ARN", raising=False)
+        assert load_secret("TEST_SECRET_PLAIN", "TEST_SECRET_ARN") == "shh"
+
+    def test_uses_secrets_manager_when_arn_present(self, monkeypatch):
+        import sys
+        import types
+        from config import secrets as secrets_mod
+
+        fake_boto3 = types.ModuleType("boto3")
+        fake_client = type("C", (), {
+            "get_secret_value": lambda self, SecretId: {"SecretString": "from-aws"}
+        })()
+        fake_boto3.client = lambda name: fake_client
+        monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+        monkeypatch.setenv("TEST_SECRET_ARN", "arn:aws:secretsmanager:...:secret:x")
+
+        assert secrets_mod.load_secret("TEST_SECRET_PLAIN", "TEST_SECRET_ARN") == "from-aws"
