@@ -56,6 +56,31 @@ class StartupReconciler:
             await self._cancel_poly_open_orders(clob_rest_url, l2_auth)
         return positions
 
+    async def fetch_poly_balance(self, clob_rest_url: str, l2_auth: PolyL2Auth) -> float:
+        """pUSD collateral balance via GET /balance-allowance. Raw units
+        are 6-decimal, same as the order amounts we sign."""
+        url = f"{clob_rest_url.rstrip('/')}/balance-allowance"
+        path = urlparse(url).path
+        headers = l2_auth.headers("GET", path)
+        try:
+            async with self._session.get(
+                url, params={"asset_type": "COLLATERAL"}, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=5.0),
+            ) as resp:
+                if resp.status != 200:
+                    self._log.error("poly_balance_fetch_failed", status=resp.status)
+                    return 0.0
+                data = await resp.json()
+        except Exception as exc:
+            self._log.error("poly_balance_error", error=str(exc))
+            return 0.0
+
+        try:
+            return float(data.get("balance", 0)) / 1_000_000
+        except (TypeError, ValueError):
+            self._log.error("poly_balance_unexpected_shape", body=str(data)[:200])
+            return 0.0
+
     async def _fetch_poly_positions(
         self,
         wallet_address: str,
@@ -160,6 +185,33 @@ class StartupReconciler:
         positions = await self._fetch_kalshi_positions(rest_url, api_key_id, rsa_signer, ticker_to_mid)
         await self._cancel_kalshi_open_orders(rest_url, api_key_id, rsa_signer)
         return positions
+
+    async def fetch_kalshi_balance(
+        self, rest_url: str, api_key_id: str, rsa_signer: KalshiRsaSigner,
+    ) -> float:
+        """USD balance via GET /portfolio/balance. Field name is another
+        one that's shifted with the fixed-point migration, parsed
+        defensively same as everywhere else Kalshi touches this repo."""
+        url = f"{rest_url.rstrip('/')}/portfolio/balance"
+        headers = self._kalshi_headers(api_key_id, rsa_signer, "GET", url)
+        try:
+            async with self._session.get(
+                url, headers=headers, timeout=aiohttp.ClientTimeout(total=5.0),
+            ) as resp:
+                if resp.status != 200:
+                    self._log.error("kalshi_balance_fetch_failed", status=resp.status)
+                    return 0.0
+                data = await resp.json()
+        except Exception as exc:
+            self._log.error("kalshi_balance_error", error=str(exc))
+            return 0.0
+
+        if "balance_dollars" in data:
+            return float(data["balance_dollars"])
+        if "balance" in data:
+            return float(data["balance"]) / 100.0   # legacy cents
+        self._log.error("kalshi_balance_unexpected_shape", body=str(data)[:200])
+        return 0.0
 
     def _kalshi_headers(self, api_key_id: str, rsa_signer: KalshiRsaSigner, method: str, url: str) -> dict:
         import time as _time
