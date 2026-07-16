@@ -505,3 +505,22 @@ class TestKalshiOrderManagerWireFormat:
             return "bid" if side_str == "BUY" else "ask"
         assert wire_side("BUY") == "bid"
         assert wire_side("SELL") == "ask"
+
+
+class TestRoundToTick:
+    """An order priced off-tick gets rejected outright, this is the
+    kind of bug that only shows up once in a while depending on what
+    fair value happens to compute that tick."""
+
+    def test_snaps_to_nearest_tick(self):
+        from src.execution.order_types import round_to_tick
+        assert round_to_tick(0.4738, 0.01) == 0.47
+        assert round_to_tick(0.4762, 0.01) == 0.48
+
+    def test_zero_tick_is_noop(self):
+        from src.execution.order_types import round_to_tick
+        assert round_to_tick(0.4738, 0.0) == 0.4738
+
+    def test_already_on_tick_unchanged(self):
+        from src.execution.order_types import round_to_tick
+        assert round_to_tick(0.56, 0.01) == 0.56
