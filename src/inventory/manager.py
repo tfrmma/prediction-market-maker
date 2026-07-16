@@ -212,6 +212,27 @@ class InventoryManager:
             total_balance=balance,
         )
 
+    def seed_position(self, market_id: str, net_qty: float, avg_entry: float) -> None:
+        """
+        Overwrite a freshly-registered (zeroed) position with what the
+        venue actually reports we're holding. Only meant to be called
+        once at startup, right after register_market and before any
+        fills come in, this is not a general-purpose position setter.
+        """
+        pos = self._positions.get(market_id)
+        if pos is None:
+            self._log.warning("seed_position_unknown_market", market_id=market_id)
+            return
+        if net_qty >= 0:
+            pos.net_qty = net_qty
+            pos.long_qty = net_qty
+            pos.avg_entry_long = avg_entry
+        else:
+            pos.net_qty = net_qty
+            pos.short_qty = -net_qty
+            pos.avg_entry_short = avg_entry
+        self._log.info("position_seeded", market_id=market_id, net_qty=net_qty, avg_entry=avg_entry)
+
     # State updates
     def on_fill(
         self,
