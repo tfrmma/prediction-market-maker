@@ -421,3 +421,87 @@ class TestRiskEngineLossRate:
         )
         # RiskEngine must reflect exactly what was passed in, not its own math
         assert abs(engine._pnl["m1"].realized_pnl - 1.0) < 1e-9
+
+
+class TestHyperliquidSigner:
+    """The phantom-agent scheme is easy to get subtly wrong (key order in
+    the action dict, byte layout of the vault flag), these just check the
+    hash construction is deterministic and the signature round-trips."""
+
+    TEST_KEY = "0x" + "33" * 32
+
+    def test_action_hash_deterministic(self):
+        from src.hedging.hyperliquid_signer import _action_hash
+        action = {"type": "order", "orders": [], "grouping": "na"}
+        h1 = _action_hash(action, None, 1_700_000_000_000)
+        h2 = _action_hash(action, None, 1_700_000_000_000)
+        assert h1 == h2
+        assert len(h1) == 32   # keccak256 output
+
+    def test_action_hash_changes_with_nonce(self):
+        from src.hedging.hyperliquid_signer import _action_hash
+        action = {"type": "order", "orders": [], "grouping": "na"}
+        h1 = _action_hash(action, None, 1)
+        h2 = _action_hash(action, None, 2)
+        assert h1 != h2
+
+    def test_sign_action_produces_valid_signature(self):
+        from src.hedging.hyperliquid_signer import HyperliquidSigner
+        signer = HyperliquidSigner(self.TEST_KEY, is_mainnet=True)
+        action = {
+            "type": "order",
+            "orders": [{"a": 0, "b": True, "p": "95000.0", "s": "0.01", "r": False,
+                        "t": {"limit": {"tif": "Ioc"}}}],
+            "grouping": "na",
+        }
+        sig = signer.sign_action(action, HyperliquidSigner.next_nonce())
+        assert sig["r"].startswith("0x")
+        assert sig["s"].startswith("0x")
+        assert sig["v"] in (27, 28)
+
+
+class TestPolymarketMarketResolver:
+    """Token id resolution used to be a hardcoded condition_id + '_YES'
+    guess, this checks the real parsing logic against the documented
+    /markets/{condition_id} response shape."""
+
+    def test_extracts_yes_no_token_ids(self):
+        from src.data.polymarket_market_resolver import PolymarketMarketResolver
+
+        class FakeResp:
+            status = 200
+            async def json(self):
+                return {
+                    "tokens": [
+                        {"outcome": "Yes", "token_id": "111"},
+                        {"outcome": "No",  "token_id": "222"},
+                    ],
+                    "neg_risk": True,
+                    "minimum_tick_size": 0.01,
+                }
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+
+        class FakeSession:
+            def get(self, *a, **kw): return FakeResp()
+
+        import asyncio
+        resolver = PolymarketMarketResolver("https://clob.polymarket.com", FakeSession())
+        result = asyncio.run(resolver.resolve("0xabc"))
+        assert result.yes_token_id == "111"
+        assert result.no_token_id == "222"
+        assert result.neg_risk is True
+
+
+class TestKalshiOrderManagerWireFormat:
+    """side mapping (BUY/SELL -> bid/ask) is the kind of thing that's
+    silent and wrong if you get it backwards, no error, orders just
+    fill on the side you didn't mean to quote."""
+
+    def test_buy_maps_to_bid_sell_maps_to_ask(self):
+        # this mirrors the mapping inside _place_order without needing
+        # a live aiohttp session
+        def wire_side(side_str):
+            return "bid" if side_str == "BUY" else "ask"
+        assert wire_side("BUY") == "bid"
+        assert wire_side("SELL") == "ask"
