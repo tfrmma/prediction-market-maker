@@ -2,7 +2,7 @@
 
 Algorithmic market making engine for binary prediction markets. Targets **Polymarket CLOB (V2)** and **Kalshi**, with delta-neutral hedging via **Hyperliquid** perpetuals.
 
-This is a real trading system, not a demo. It signs and submits live orders, tracks real inventory and collateral, and has an independent kill switch. Read the [Known Gaps](#known-gaps) section before pointing it at real capital.
+This signs and submits live orders, tracks real inventory and collateral, and has an independent kill switch. Read [What's left](#whats-left) before you point it at real size.
 
 ## Architecture
 
@@ -177,6 +177,11 @@ git clone <this repo>
 cd prediction-market-maker
 
 pip install -e ".[test]"
+
+# add the aws extra if you're pulling Kalshi's PEM from Secrets Manager
+# (see KALSHI_PEM_SECRET_ARN below), it's a lazy import otherwise so
+# don't bother if you're just using the plaintext env var
+pip install -e ".[test,aws]"
 ```
 
 ## Configuration
@@ -343,16 +348,15 @@ If the process restarts with resting orders still live on either exchange, start
 - **Positions**: pulled from Polymarket's Data API (`GET /positions`, public) and Kalshi's `GET /portfolio/positions`, and used to seed `InventoryManager` directly.
 - **Resting orders**: pulled from Polymarket's `GET /data/orders` and Kalshi's `GET /portfolio/orders?status=resting`, and cancelled outright rather than adopted back into tracked state. Queue position and partial-fill history from a previous process can't be recovered reliably, flattening and re-quoting fresh is the safer default.
 
-## Known gaps
+## What's left
 
-Closed as of this revision: Polymarket CLOB V2 order signing (real 6-decimal amounts, correct domain, neg-risk contract routing), the L2 HMAC auth that requests previously went out without, Kalshi's bids-only order book (was being parsed as if it had a real ask side), a working Kalshi execution engine (order placement, cancellation, own-fill feed, none of which existed before), real Hyperliquid phantom-agent signing (was a placeholder `{r, s, v}` that never worked), a live Hyperliquid price/vol feed for the hedge engine (was a hardcoded constant), the own-fill feedback loop on both venues, post-only and tick-size rounding on both venues, a symmetric self-trade guard, startup reconciliation, real order sizing tied to edge/vol/free collateral (was `min_edge_bps * 10`), a drained `health_queue` with degradation logging, Kalshi's PEM sourced from a secrets manager when configured (falls back to env var otherwise), and hedge crossing slippage scaled to realized vol instead of a flat 0.5%.
+Closed in this revision: real Polymarket CLOB V2 signing (6-decimal amounts, correct domain, neg-risk routing), L2 HMAC auth on every authenticated request, Kalshi's bids-only book (was getting parsed like it had a real ask side), a full Kalshi execution engine that didn't exist before, real Hyperliquid phantom-agent signing (was a placeholder that never actually signed anything), a live Hyperliquid price/vol feed instead of a hardcoded constant, the own-fill feedback loop on both venues, post-only and tick-size rounding on both venues, a symmetric self-trade guard, startup reconciliation, order sizing tied to edge/vol/free collateral instead of a made-up constant, a `health_queue` that actually gets read, Kalshi's PEM off a secrets manager when you want it, and hedge slippage that scales with real vol instead of a flat 0.5%.
 
-Still open:
+Still on the list:
 
-- **No integration testing against live sandboxes.** Everything above is validated at the unit level with mocks. None of it has been run against Kalshi's demo environment, Hyperliquid testnet, or Polymarket with real size.
-- **`ManagedOrder.status` never transitions `PENDING -> OPEN`.** Doesn't break anything today, but any future logic that branches on that distinction will be wrong.
-- **Order sizing is a linear heuristic, not a proper bankroll model.** It's now bounded by edge, vol, and free collateral rather than being a constant, but it's still not Kelly-sized or aware of cross-market correlation.
-- **`_health_monitor` logs, it doesn't act.** A feed staying disconnected or laggy for an extended period gets logged loudly but doesn't itself trigger the kill switch, that's still `RiskEngine`'s book-staleness check on a different, coarser timescale.
+- **`ManagedOrder.status` never moves `PENDING -> OPEN`.** Doesn't break anything right now, but the first bit of logic that branches on that distinction is going to be wrong.
+- **Sizing is bounded, not smart.** It won't blow through your risk budget anymore, but it's not Kelly-sized and doesn't know about correlation across markets.
+- **`_health_monitor` logs, it doesn't act.** A feed going quiet gets logged loudly but doesn't trip the kill switch on its own, that's still `RiskEngine`'s staleness check running on its own clock.
 
 ## Design decisions
 
