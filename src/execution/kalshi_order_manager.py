@@ -32,7 +32,7 @@ import structlog
 from config.settings import RiskProfile
 from src.data.unified_book import MarketState
 from src.execution.kalshi_auth import KalshiRsaSigner
-from src.execution.order_types import FlickeringFilter, ManagedOrder, OrderSideStr, OrderStatus
+from src.execution.order_types import FlickeringFilter, ManagedOrder, OrderSideStr, OrderStatus, round_to_tick
 from src.pricing.fair_value import FairValueResult
 
 logger = structlog.get_logger(__name__)
@@ -64,8 +64,55 @@ class KalshiOrderManager:
 
         self._live: Dict[Tuple[str, str], ManagedOrder] = {}
         self._all: Dict[str, ManagedOrder] = {}
+        # tick_size field on Market got removed 2026-05-07 in favor of
+        # price_ranges/price_level_structure, resolved lazily per ticker
+        # and cached since it doesn't change mid-session
+        self._tick_cache: Dict[str, float] = {}
 
         self._log = logger.bind(component="kalshi_order_manager")
+
+    async def _resolve_tick(self, ticker: str) -> float:
+        """
+        Best-effort tick size lookup. Kalshi removed the flat `tick_size`
+        market field on 2026-05-07 in favor of `price_ranges` (each with
+        its own step), and that schema has already shifted more than
+        once this year. We take the first range's step_dollars and fall
+        back to a $0.01 default if the response doesn't look like what
+        we expect, logging loudly so it doesn't fail silently.
+        """
+        if ticker in self._tick_cache:
+            return self._tick_cache[ticker]
+
+        default = 0.01
+        url = f"{self._rest_url}/markets/{ticker}"
+        try:
+            async with self._session.get(
+                url, timeout=aiohttp.ClientTimeout(total=5.0),
+            ) as resp:
+                if resp.status != 200:
+                    self._log.warning("tick_resolve_failed", ticker=ticker, status=resp.status)
+                    self._tick_cache[ticker] = default
+                    return default
+                data = await resp.json()
+        except Exception as exc:
+            self._log.warning("tick_resolve_error", ticker=ticker, error=str(exc))
+            self._tick_cache[ticker] = default
+            return default
+
+        market = data.get("market", data)
+        ranges = market.get("price_ranges") or []
+        tick = default
+        if ranges:
+            try:
+                tick = float(ranges[0].get("step_dollars", default))
+            except (TypeError, ValueError):
+                self._log.warning("tick_resolve_unexpected_shape", ticker=ticker, ranges=ranges[:1])
+                tick = default
+        else:
+            self._log.warning("tick_resolve_no_ranges", ticker=ticker)
+
+        self._tick_cache[ticker] = tick
+        return tick
 
     async def update_quotes(
         self,
@@ -85,6 +132,8 @@ class KalshiOrderManager:
             await self._handle_max_inventory(market_id, ticker, inventory_q)
             return
 
+        tick_size = await self._resolve_tick(ticker)
+
         for side_str, quote_price in [
             ("BUY",  fv.bid_quote),
             ("SELL", fv.ask_quote),
@@ -92,15 +141,22 @@ class KalshiOrderManager:
             opposite = "SELL" if side_str == "BUY" else "BUY"
             opp_order = self._live.get((market_id, opposite))
             if opp_order and opp_order.status == OrderStatus.OPEN:
-                if side_str == "BUY" and quote_price >= opp_order.price:
-                    self._log.warning("stp_guard", market_id=market_id, bid=quote_price, ask=opp_order.price)
+                crosses = (
+                    (side_str == "BUY"  and quote_price >= opp_order.price) or
+                    (side_str == "SELL" and quote_price <= opp_order.price)
+                )
+                if crosses:
+                    self._log.warning(
+                        "stp_guard", market_id=market_id, side=side_str,
+                        quote_price=quote_price, opposite_price=opp_order.price,
+                    )
                     continue
 
             if self._flicker.is_frozen(market_id, side_str):
                 self._log.debug("quote_frozen_by_flicker", market_id=market_id, side=side_str)
                 continue
 
-            await self._update_side(market_id, side_str, quote_price, fv, ticker, order_size_usd)
+            await self._update_side(market_id, side_str, quote_price, fv, ticker, order_size_usd, tick_size)
 
     async def _update_side(
         self,
@@ -110,12 +166,13 @@ class KalshiOrderManager:
         fv: FairValueResult,
         ticker: str,
         order_size_usd: float,
+        tick_size: float = 0.01,
     ) -> None:
         key = (market_id, side_str)
         live = self._live.get(key)
 
         if live is None:
-            await self._place_order(market_id, side_str, quote_price, ticker, order_size_usd)
+            await self._place_order(market_id, side_str, quote_price, ticker, order_size_usd, tick_size)
             return
 
         age_s = time.monotonic() - live.placed_ts
@@ -136,7 +193,7 @@ class KalshiOrderManager:
         )
         cancelled = await self._cancel_order(live)
         if cancelled:
-            await self._place_order(market_id, side_str, quote_price, ticker, order_size_usd)
+            await self._place_order(market_id, side_str, quote_price, ticker, order_size_usd, tick_size)
 
     # Order operations
     def _auth_headers(self, method: str, url: str) -> dict:
@@ -151,8 +208,10 @@ class KalshiOrderManager:
         price: float,
         ticker: str,
         size_usd: float,
+        tick_size: float = 0.01,
     ) -> Optional[ManagedOrder]:
-        n_contracts = round(size_usd / max(price, 0.01), 2)
+        price = round_to_tick(price, tick_size)
+        n_contracts = round(size_usd / max(price, tick_size), 2)
         if n_contracts <= 0:
             return None
 
