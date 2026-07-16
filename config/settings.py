@@ -11,6 +11,8 @@ from typing import Dict, Optional
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings  # pydantic v2 compat shim
 
+from config.secrets import load_secret
+
 
 # Venue Enums
 class Venue(str, Enum):
@@ -34,6 +36,8 @@ class RiskProfile(BaseModel):
     per_trade_loss_limit: float = Field(50.0,  description="Max loss accepted before cancelling side")
     max_inventory_contracts: int  = Field(500,    description="Max contracts long or short per market")
     min_edge_bps: float = Field(15.0,  description="Minimum spread capture in bps to quote")
+    base_order_size_usd: float = Field(25.0, description="Order size at min_edge_bps / average vol")
+    max_order_size_usd: float = Field(150.0, description="Hard ceiling regardless of edge/vol scaling")
     toxic_flow_pause_ms: int  = Field(5_000,  description="Quote freeze ms after toxicity detection")
     flickering_window_ms: int  = Field(500,    description="Window to detect sub-500ms cancel patterns")
     flickering_cancel_threshold: int  = Field(3,      description="N cancels in window → freeze side")
@@ -51,6 +55,9 @@ class HedgeProfile(BaseModel):
     correlation_min_abs: float = Field(0.60,  description="Minimum |ρ| to allow delta hedge via perp")
     hedge_size_multiplier: float = Field(0.90, description="Hedge ratio < 1 to account for basis risk")
     is_mainnet: bool = Field(True, description="Hyperliquid signing domain: mainnet vs testnet")
+    min_slip_bps: float = Field(10.0, description="Floor on the IOC crossing buffer, even in dead-quiet markets")
+    max_slip_bps: float = Field(200.0, description="Ceiling on the IOC crossing buffer, however wild vol gets")
+    slip_vol_multiplier: float = Field(4.0, description="Std-dev multiplier on the vol-scaled slippage buffer")
 
 
 # Market Configuration
@@ -81,7 +88,11 @@ class PolymarketCredentials(BaseModel):
 
 class KalshiCredentials(BaseModel):
     api_key_id: str  = Field(default_factory=lambda: os.environ["KALSHI_KEY_ID"])
-    private_key_pem: str = Field(default_factory=lambda: os.environ["KALSHI_PEM"])
+    # KALSHI_PEM_SECRET_ARN, if set, sources this from AWS Secrets Manager
+    # instead of the plaintext KALSHI_PEM env var. See config/secrets.py.
+    private_key_pem: str = Field(
+        default_factory=lambda: load_secret("KALSHI_PEM", "KALSHI_PEM_SECRET_ARN")
+    )
     # Kalshi uses RSA PKCS8 signing as of API v2
 
 
