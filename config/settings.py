@@ -50,6 +50,7 @@ class HedgeProfile(BaseModel):
     correlation_window: int   = Field(300,   description="Rolling window (seconds) for ρ estimation")
     correlation_min_abs: float = Field(0.60,  description="Minimum |ρ| to allow delta hedge via perp")
     hedge_size_multiplier: float = Field(0.90, description="Hedge ratio < 1 to account for basis risk")
+    is_mainnet: bool = Field(True, description="Hyperliquid signing domain: mainnet vs testnet")
 
 
 # Market Configuration
@@ -59,11 +60,10 @@ class MarketConfig(BaseModel):
     venue: Venue
     resolution_ts: int          # Unix timestamp of expected resolution
     underlying_symbol: Optional[str] = None   # e.g. "BTC" for correlated hedging
-    # Whether this market settles through the Neg Risk CTF Exchange V2
-    # (different verifyingContract for order signing). MUST be read from
-    # the market/orderbook response's `neg_risk` field , same startup
-    # resolution step as yes/no token IDs (see known gap #2 in README).
-    neg_risk: bool = False
+    # Strike/threshold for the underlying, e.g. 100_000 for a "BTC > $100k"
+    # market. Has to come from config, there's no generic way to parse it
+    # out of a market's title/ticker across venues.
+    underlying_strike: Optional[float] = None
     tick_size: float = 0.01
     min_order_size: float = 1.0  # USD notional
     risk: RiskProfile = Field(default_factory=RiskProfile)
@@ -106,6 +106,7 @@ class Settings(BaseModel):
     kalshi_ws_url: str = "wss://api.elections.kalshi.com/trade-api/ws/v2"
     kalshi_rest_url: str = "https://api.elections.kalshi.com/trade-api/v2"
     hl_ws_url: str    = "wss://api.hyperliquid.xyz/ws"
+    hl_rest_url: str  = "https://api.hyperliquid.xyz"
 
     # Credentials (lazy-loaded from env)
     polymarket: Optional[PolymarketCredentials] = None
