@@ -21,13 +21,19 @@ from config.settings import Settings, get_settings, Venue
 from src.data.polymarket_feed import (
     PolymarketFeed, PolyMarket, PolymarketUserFeed, PolyOwnFill,
 )
-from src.data.kalshi_feed import KalshiFeed
+from src.data.polymarket_market_resolver import PolymarketMarketResolver, ResolvedMarket
+from src.data.kalshi_feed import KalshiFeed, KalshiOwnFill
 from src.data.unified_book import BookRegistry, MarketState, BookSource
 from src.pricing.fair_value import FairValueEngine, ASBinaryParams, ParameterCalibrator
 from src.execution.eip712_signer import EIP712Signer
-from src.execution.order_manager import OrderManager, FlickeringFilter
+from src.execution.order_manager import OrderManager
+from src.execution.order_types import FlickeringFilter
 from src.execution.polymarket_auth import PolyL2Auth, PolyL2Credentials
+from src.execution.kalshi_auth import KalshiRsaSigner
+from src.execution.kalshi_order_manager import KalshiOrderManager
 from src.hedging.delta_hedge import HedgeEngine
+from src.hedging.hyperliquid_signer import HyperliquidSigner
+from src.hedging.hyperliquid_price_feed import HyperliquidPriceFeed
 from src.risk.engine import RiskEngine
 from src.inventory.manager import InventoryManager
 
@@ -58,10 +64,17 @@ class Orchestrator:
         self._pricing_engine = FairValueEngine()
         self._risk_engine:   RiskEngine = None
         self._order_manager: OrderManager = None
+        self._kalshi_order_manager: KalshiOrderManager = None
         self._hedge_engine:  HedgeEngine = None
+        self._hl_price_feed: HyperliquidPriceFeed = None
         self._signer:        EIP712Signer = None
         # single source of truth for position/collateral
         self._inventory_mgr: InventoryManager = None
+        # condition_id -> ResolvedMarket (real token ids, neg_risk, tick size)
+        self._resolved_poly: Dict[str, ResolvedMarket] = {}
+        # condition_id / kalshi ticker -> our market_id key. Fill events
+        # come back keyed by the venue's own identifier, not ours.
+        self._condition_to_mid: Dict[str, str] = {}
 
     async def run(self) -> None:
         """Start all subsystems and run until kill signal."""
@@ -74,6 +87,8 @@ class Orchestrator:
             asyncio.create_task(self._calibration_loop(), name="calibrator"),
             asyncio.create_task(self._monitor_kill(),    name="kill_monitor"),
         ]
+        if self._hl_price_feed is not None:
+            tasks.append(asyncio.create_task(self._hl_price_feed.run(), name="hl_price_feed"))
 
         logger.info("orchestrator_started", n_markets=len(self._cfg.markets))
 
@@ -108,6 +123,21 @@ class Orchestrator:
                 address=self._signer.address,
             ))
 
+        # resolve real yes/no token ids + neg_risk off the CLOB, the old
+        # condition_id + "_YES" placeholder never matched anything real
+        poly_market_ids = [
+            mid for mid, mconf in self._cfg.markets.items()
+            if mconf.venue == Venue.POLYMARKET
+        ]
+        if poly_market_ids and poly_creds:
+            resolver = PolymarketMarketResolver(self._cfg.poly_rest_url, self._http_session)
+            for mid in poly_market_ids:
+                resolved = await resolver.resolve(self._cfg.markets[mid].condition_id)
+                if resolved is None:
+                    logger.error("poly_market_unresolved", market_id=mid)
+                    continue
+                self._resolved_poly[mid] = resolved
+
         # Order manager
         self._order_manager = OrderManager(
             http_session=self._http_session,
@@ -117,6 +147,15 @@ class Orchestrator:
             flickering_filter=FlickeringFilter(),
             l2_auth=l2_auth,
         )
+
+        if self._cfg.kalshi:
+            self._kalshi_order_manager = KalshiOrderManager(
+                http_session=self._http_session,
+                api_key_id=self._cfg.kalshi.api_key_id,
+                rsa_signer=KalshiRsaSigner(self._cfg.kalshi.private_key_pem),
+                risk_profile=next(iter(self._cfg.markets.values())).risk,
+                rest_url=self._cfg.kalshi_rest_url,
+            )
 
         # inventory manager: position size, VWAP cost basis, realized PnL
         self._inventory_mgr = InventoryManager(
@@ -135,6 +174,7 @@ class Orchestrator:
                       else BookSource.KALSHI)
             self._book_registry.register(mid, source, mconf.resolution_ts)
             self._inventory_mgr.register_market(mid, mconf.venue.value)
+            self._condition_to_mid[mconf.condition_id] = mid
             self._last_mid[mid]  = 0.0
             self._params[mid]    = ASBinaryParams()
             self._calibrators[mid] = ParameterCalibrator(ASBinaryParams())
@@ -147,11 +187,21 @@ class Orchestrator:
 
         # Hedge engine
         if hl_creds:
+            coins = sorted({
+                mconf.underlying_symbol for mconf in self._cfg.markets.values()
+                if mconf.underlying_symbol
+            })
+            self._hl_price_feed = HyperliquidPriceFeed(self._cfg.hl_rest_url, coins)
+            hl_signer = HyperliquidSigner(
+                hl_creds.private_key,
+                is_mainnet=next(iter(self._cfg.markets.values())).hedge.is_mainnet,
+            )
             self._hedge_engine = HedgeEngine(
                 profile=next(iter(self._cfg.markets.values())).hedge,
-                hl_url="https://api.hyperliquid.xyz",
-                hl_wallet=hl_creds.wallet_address,
-                hl_private_key=hl_creds.private_key,
+                hl_url=self._cfg.hl_rest_url,
+                signer=hl_signer,
+                asset_index_fn=self._hl_price_feed.get_asset_index,
+                sz_decimals_fn=self._hl_price_feed.get_sz_decimals,
             )
             for mid in self._cfg.markets:
                 self._hedge_engine.register_market(mid)
@@ -170,11 +220,19 @@ class Orchestrator:
             poly_markets = [
                 PolyMarket(
                     condition_id=m.condition_id,
-                    yes_token_id=m.condition_id + "_YES",  # placeholder; fetch from REST at startup
-                    no_token_id=m.condition_id + "_NO",
+                    yes_token_id=self._resolved_poly[mid].yes_token_id,
+                    no_token_id=self._resolved_poly[mid].no_token_id,
+                    neg_risk=self._resolved_poly[mid].neg_risk,
                 )
-                for m in poly_markets_cfg
+                for mid, m in self._cfg.markets.items()
+                if m.venue == Venue.POLYMARKET and mid in self._resolved_poly
             ]
+            if len(poly_markets) < len(poly_markets_cfg):
+                logger.warning(
+                    "some_poly_markets_unresolved",
+                    resolved=len(poly_markets),
+                    configured=len(poly_markets_cfg),
+                )
             feed = PolymarketFeed(
                 ws_url=self._cfg.poly_ws_url,
                 markets=poly_markets,
@@ -213,13 +271,18 @@ class Orchestrator:
             )
             tasks.append(asyncio.create_task(feed.run(), name="kalshi_feed"))
 
-        # Dispatch loop: feed_queue → BookRegistry
+        # Dispatch loop: feed_queue -> BookRegistry (or fill dispatch for
+        # Kalshi's own-fill events, which arrive on the same connection
+        # as book data since Kalshi auths the whole socket up front)
         async def dispatch():
             while not self._kill_event.is_set():
                 try:
                     event = await asyncio.wait_for(
                         self._feed_queue.get(), timeout=1.0
                     )
+                    if isinstance(event, KalshiOwnFill):
+                        await self._handle_kalshi_fill(event)
+                        continue
                     await self._book_registry.process(event)
                     self._risk_engine.on_book_update(
                         "", time.monotonic()
@@ -231,9 +294,58 @@ class Orchestrator:
         await asyncio.gather(*tasks)
 
     # Fill dispatch
+    def _apply_fill(self, market_id: str, order_id: str, side: str, price: float, size: float) -> None:
+        """Shared by both venues: push the fill through OrderManager,
+        InventoryManager (source of truth), and RiskEngine."""
+        mconf = self._cfg.markets.get(market_id)
+        if mconf is None:
+            return
+
+        mgr = self._order_manager if mconf.venue == Venue.POLYMARKET else self._kalshi_order_manager
+        mgr.mark_filled(order_id, size)
+
+        collateral_used = price * size if side == "BUY" else (1 - price) * size
+        realized = self._inventory_mgr.on_fill(
+            market_id=market_id,
+            fill_side=side,
+            fill_price=price,
+            fill_qty=size,
+            collateral_used=collateral_used,
+        )
+
+        mid_at_fill = self._last_mid.get(market_id, price)
+        self._risk_engine.on_fill(
+            market_id=market_id,
+            order_id=order_id,
+            fill_price=price,
+            fill_size=size,
+            side=side,
+            mid_at_fill=mid_at_fill,
+            realized_pnl=realized,
+        )
+
+        logger.info(
+            "fill_dispatched",
+            market_id=market_id,
+            venue=mconf.venue.value,
+            side=side,
+            price=round(price, 4),
+            size=size,
+            realized_pnl=round(realized, 4),
+            net_qty=round(self._inventory_mgr.get_net_qty(market_id), 2),
+        )
+
+    async def _handle_kalshi_fill(self, ev: KalshiOwnFill) -> None:
+        market_id = self._condition_to_mid.get(ev.market_ticker)
+        if market_id is None:
+            return
+        # action "buy"/"sell" on the yes leg maps straight onto our BUY/SELL
+        side = "BUY" if ev.action == "buy" else "SELL"
+        self._apply_fill(market_id, ev.order_id, side, ev.yes_price, ev.count)
+
     async def _fill_dispatch(self) -> None:
-        """Own-fill events -> OrderManager, InventoryManager (source of
-        truth for position/PnL), and RiskEngine's kill-switch tracking."""
+        """Polymarket own-fill events, drained off _fill_queue since the
+        user channel is a separate websocket connection there."""
         while not self._kill_event.is_set():
             try:
                 ev = await asyncio.wait_for(self._fill_queue.get(), timeout=1.0)
@@ -242,43 +354,11 @@ class Orchestrator:
 
             if not isinstance(ev, PolyOwnFill):
                 continue
-
-            market_id = ev.condition_id
-            mconf = self._cfg.markets.get(market_id)
-            if mconf is None:
+            market_id = self._condition_to_mid.get(ev.condition_id)
+            if market_id is None:
                 continue
 
-            self._order_manager.mark_filled(ev.order_id, ev.size)
-
-            collateral_used = ev.price * ev.size if ev.side == "BUY" else (1 - ev.price) * ev.size
-            realized = self._inventory_mgr.on_fill(
-                market_id=market_id,
-                fill_side=ev.side,
-                fill_price=ev.price,
-                fill_qty=ev.size,
-                collateral_used=collateral_used,
-            )
-
-            mid_at_fill = self._last_mid.get(market_id, ev.price)
-            self._risk_engine.on_fill(
-                market_id=market_id,
-                order_id=ev.order_id,
-                fill_price=ev.price,
-                fill_size=ev.size,
-                side=ev.side,
-                mid_at_fill=mid_at_fill,
-                realized_pnl=realized,
-            )
-
-            logger.info(
-                "fill_dispatched",
-                market_id=market_id,
-                side=ev.side,
-                price=round(ev.price, 4),
-                size=ev.size,
-                realized_pnl=round(realized, 4),
-                net_qty=round(self._inventory_mgr.get_net_qty(market_id), 2),
-            )
+            self._apply_fill(market_id, ev.order_id, ev.side, ev.price, ev.size)
 
     # Strategy loop
     async def _strategy_loop(self) -> None:
@@ -338,21 +418,46 @@ class Orchestrator:
 
             # Update quotes (order manager handles cancel/replace)
             if not self._kill_event.is_set():
-                yes_token_id = mconf.condition_id + "_YES"  # resolved at startup
-                await self._order_manager.update_quotes(
-                    state=state,
-                    fv=fv,
-                    yes_token_id=yes_token_id,
-                    inventory_q=self._inventory_mgr.get_net_qty(mid_id),
-                    order_size_usd=mconf.risk.min_edge_bps * 10,  # size proportional to edge
-                    neg_risk=mconf.neg_risk,
-                )
+                if mconf.venue == Venue.POLYMARKET:
+                    resolved = self._resolved_poly.get(mid_id)
+                    if resolved is None:
+                        continue  # never resolved at startup, can't quote safely
+                    await self._order_manager.update_quotes(
+                        state=state,
+                        fv=fv,
+                        yes_token_id=resolved.yes_token_id,
+                        inventory_q=self._inventory_mgr.get_net_qty(mid_id),
+                        order_size_usd=mconf.risk.min_edge_bps * 10,  # size proportional to edge
+                        neg_risk=resolved.neg_risk,
+                    )
+                elif self._kalshi_order_manager:
+                    await self._kalshi_order_manager.update_quotes(
+                        state=state,
+                        fv=fv,
+                        ticker=mconf.condition_id,
+                        inventory_q=self._inventory_mgr.get_net_qty(mid_id),
+                        order_size_usd=mconf.risk.min_edge_bps * 10,
+                    )
 
             # Trigger hedge if needed
             if self._hedge_engine and mconf.hedge.enabled and mconf.underlying_symbol:
-                S_perp = 95_000.0  # TODO: pull from live CEX feed
-                sigma_perp = 0.60  # TODO: compute from realized vol window
-                K_strike = 100_000.0  # TODO: parse from market name
+                coin = mconf.underlying_symbol
+                S_perp = self._hl_price_feed.get_mid(coin) if self._hl_price_feed else None
+                sigma_perp = self._hl_price_feed.get_realized_vol(coin) if self._hl_price_feed else None
+                K_strike = mconf.underlying_strike
+
+                if S_perp is None or sigma_perp is None or K_strike is None:
+                    # missing live price, not enough vol history yet, or no
+                    # strike configured for this market, skip rather than
+                    # hedge off a guess
+                    logger.debug(
+                        "hedge_skipped_missing_data",
+                        market_id=mid_id,
+                        has_price=S_perp is not None,
+                        has_vol=sigma_perp is not None,
+                        has_strike=K_strike is not None,
+                    )
+                    continue
 
                 instr = await self._hedge_engine.compute_and_hedge(
                     market_id=mid_id,
@@ -362,7 +467,7 @@ class Orchestrator:
                     K_strike=K_strike,
                     sigma_perp=sigma_perp,
                     T_res_s=state.time_to_resolution_s,
-                    perp_symbol=f"{mconf.underlying_symbol}-PERP",
+                    perp_symbol=coin,
                 )
                 if instr:
                     await self._hedge_engine.execute_hedge(
