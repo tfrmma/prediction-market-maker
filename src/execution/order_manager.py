@@ -12,10 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections import defaultdict, deque
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import aiohttp
 import structlog
@@ -23,93 +20,11 @@ import structlog
 from config.settings import RiskProfile
 from src.data.unified_book import MarketState
 from src.execution.eip712_signer import EIP712Signer, OrderParams, OrderSide, SignedOrder
+from src.execution.order_types import FlickeringFilter, ManagedOrder, OrderSideStr, OrderStatus
 from src.execution.polymarket_auth import PolyL2Auth
 from src.pricing.fair_value import FairValueResult
 
 logger = structlog.get_logger(__name__)
-
-
-# Types
-class OrderStatus(str, Enum):
-    PENDING      = "pending"      # sent, awaiting ack
-    OPEN         = "open"         # on book
-    PARTIAL_FILL = "partial_fill"
-    FILLED       = "filled"
-    CANCELLED    = "cancelled"
-    REJECTED     = "rejected"
-    FAILED       = "failed"       # network/API error
-
-
-class OrderSideStr(str, Enum):
-    BUY  = "BUY"
-    SELL = "SELL"
-
-
-@dataclass
-class ManagedOrder:
-    order_id: str
-    market_id: str
-    token_id: str
-    side: OrderSideStr
-    price: float         # quote price (probability)
-    size: float          # contracts
-    placed_ts: float     # time.monotonic()
-    status: OrderStatus  = OrderStatus.PENDING
-    filled_size: float   = 0.0
-    last_update_ts: float = field(default_factory=time.monotonic)
-
-
-# Flickering Filter
-class FlickeringFilter:
-    """
-    Detects institutional order flickering (rapid cancel-replace cycles
-    used to manipulate queue position or signal intent).
-
-    Trigger: N cancel/replace events on ONE side within WINDOW_MS.
-    Action: freeze quoting on that side for FREEZE_MS.
-    """
-
-    def __init__(
-        self,
-        window_ms: int = 500,
-        cancel_threshold: int = 3,
-        freeze_ms: int = 5_000,
-    ):
-        self._window_ms    = window_ms
-        self._threshold    = cancel_threshold
-        self._freeze_ms    = freeze_ms
-        # market_id → side → deque of cancel timestamps
-        self._cancels: Dict[str, Dict[str, Deque[float]]] = defaultdict(
-            lambda: {"BUY": deque(), "SELL": deque()}
-        )
-        # market_id → side → freeze_until (monotonic)
-        self._frozen: Dict[str, Dict[str, float]] = defaultdict(
-            lambda: {"BUY": 0.0, "SELL": 0.0}
-        )
-
-    def record_cancel(self, market_id: str, side: str, ts: float) -> None:
-        q = self._cancels[market_id][side]
-        q.append(ts)
-        cutoff = ts - self._window_ms / 1000.0
-        while q and q[0] < cutoff:
-            q.popleft()
-
-        if len(q) >= self._threshold:
-            freeze_until = ts + self._freeze_ms / 1000.0
-            self._frozen[market_id][side] = freeze_until
-            logger.warning(
-                "flickering_detected",
-                market_id=market_id,
-                side=side,
-                cancel_count=len(q),
-                freeze_s=self._freeze_ms / 1000,
-            )
-
-    def is_frozen(self, market_id: str, side: str) -> bool:
-        return time.monotonic() < self._frozen[market_id][side]
-
-    def unfreeze(self, market_id: str, side: str) -> None:
-        self._frozen[market_id][side] = 0.0
 
 
 # Order Manager
