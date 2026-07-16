@@ -16,6 +16,18 @@ import structlog
 logger = structlog.get_logger(__name__)
 
 
+def round_to_tick(price: float, tick_size: float) -> float:
+    """Snap a price to the nearest valid tick. An order priced off-tick
+    gets rejected outright, better to round here than find out from a
+    400 mid-quoting-cycle."""
+    if tick_size <= 0:
+        return price
+    ticks = round(price / tick_size)
+    # guard against float noise turning e.g. 0.5700000000000001 into a
+    # value that still doesn't compare equal to a clean multiple
+    return round(ticks * tick_size, 10)
+
+
 class OrderStatus(str, Enum):
     PENDING      = "pending"      # sent, awaiting ack
     OPEN         = "open"         # on book
