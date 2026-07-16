@@ -32,6 +32,7 @@ import aiohttp
 import structlog
 
 from config.settings import HedgeProfile
+from src.hedging.hyperliquid_signer import HyperliquidSigner
 
 logger = structlog.get_logger(__name__)
 
@@ -200,13 +201,15 @@ class HedgeEngine:
         self,
         profile: HedgeProfile,
         hl_url: str,
-        hl_wallet: str,
-        hl_private_key: str,
+        signer: HyperliquidSigner,
+        asset_index_fn,      # Callable[[str], Optional[int]], usually HyperliquidPriceFeed.get_asset_index
+        sz_decimals_fn=None,  # Callable[[str], int], defaults to 3 dp if not given
     ):
         self._profile    = profile
         self._hl_url     = hl_url.rstrip("/")
-        self._hl_wallet  = hl_wallet
-        self._hl_key     = hl_private_key
+        self._signer     = signer
+        self._asset_index_fn = asset_index_fn
+        self._sz_decimals_fn = sz_decimals_fn or (lambda coin: 3)
 
         self._corr_trackers: Dict[str, CorrelationTracker] = {}
         self._states: Dict[str, HedgeState] = {}
@@ -328,38 +331,39 @@ class HedgeEngine:
         instr: HedgeInstruction,
         S_perp: float,
     ) -> bool:
-        """
-        Submit market order to Hyperliquid.
-        Uses Hyperliquid's EVM-based action signing.
-        """
-        from eth_account import Account
-        import json
+        """Submit an IOC order to Hyperliquid to move the hedge toward target."""
+        coin = instr.symbol.removesuffix("-PERP")
+        asset_idx = self._asset_index_fn(coin)
+        if asset_idx is None:
+            self._log.error("hl_unknown_asset", coin=coin)
+            return False
+
+        sz_decimals = self._sz_decimals_fn(coin)
+        size = round(instr.size_contracts, sz_decimals)
+        if size <= 0:
+            return False
 
         is_buy = instr.side == "BUY"
+        # cross the spread on purpose, this is a hedge, not a passive quote,
+        # a few bps of slip beats being unhedged for another quoting cycle
+        limit_price = round(S_perp * (1.005 if is_buy else 0.995), 1)
 
-        # Hyperliquid order action
         order_action = {
             "type": "order",
             "orders": [{
-                "a": 0,              # asset index (BTC=0)
-                "b": is_buy,         # isBuy
-                "p": str(round(S_perp * (1.005 if is_buy else 0.995), 1)),  # limit price with slip
-                "s": str(round(instr.size_contracts, 6)),
+                "a": asset_idx,
+                "b": is_buy,
+                "p": str(limit_price),
+                "s": str(size),
                 "r": instr.is_reduce,
-                "t": {"limit": {"tif": "Ioc"}},   # IOC for immediate hedge execution
+                "t": {"limit": {"tif": "Ioc"}},
             }],
             "grouping": "na",
         }
 
-        # Sign action (Hyperliquid uses EIP-712 on their custom domain)
-        timestamp_ms = int(time.time() * 1000)
-        account = Account.from_key(self._hl_key)
-        # Simplified: in production use Hyperliquid's full signing spec
-        payload = {
-            "action": order_action,
-            "nonce": timestamp_ms,
-            "signature": {"r": "0x", "s": "0x", "v": 0},  # placeholder , use HL SDK
-        }
+        nonce = HyperliquidSigner.next_nonce()
+        signature = self._signer.sign_action(order_action, nonce)
+        payload = {"action": order_action, "nonce": nonce, "signature": signature}
 
         url = f"{self._hl_url}/exchange"
         try:
@@ -370,17 +374,17 @@ class HedgeEngine:
             ) as resp:
                 body = await resp.json()
                 if resp.status == 200 and body.get("status") == "ok":
-                    # Update tracked hedge position
                     state = self._states[instr.market_id]
                     sign = -1 if instr.side == "SELL" else 1
-                    state.gross_hedge_usd += sign * instr.size_contracts * S_perp
+                    state.gross_hedge_usd += sign * size * S_perp
                     state.total_hedge_trades += 1
                     state.last_hedge_ts = time.monotonic()
                     self._log.info(
                         "hedge_executed",
                         market_id=instr.market_id,
                         side=instr.side,
-                        size=instr.size_contracts,
+                        size=size,
+                        coin=coin,
                     )
                     return True
                 else:
