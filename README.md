@@ -173,7 +173,7 @@ Realized PnL is computed once, by `InventoryManager`, and passed down to `RiskEn
 
 ```bash
 # Python 3.11+
-git clone <this repo>
+git clone https://github.com/tfrmma/prediction-market-maker.git
 cd prediction-market-maker
 
 pip install -e ".[test]"
