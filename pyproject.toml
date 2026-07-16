@@ -25,7 +25,9 @@ dependencies = [
     # Ethereum signing
     "eth-account>=0.10",
     "eth-keys>=0.5",
+    "eth-utils>=3.0",       # keccak for Hyperliquid's phantom-agent hash
     "cryptography>=42.0",   # RSA for Kalshi
+    "msgpack>=1.0",         # Hyperliquid L1 action packing
 
     # Logging
     "structlog>=24.1",
@@ -45,6 +47,9 @@ dev = [
     "isort",
     "mypy",
     "ruff",
+]
+aws = [
+    "boto3>=1.34",   # only needed if KALSHI_PEM_SECRET_ARN is set, see config/secrets.py
 ]
 
 [tool.pytest.ini_options]
