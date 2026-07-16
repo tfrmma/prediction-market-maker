@@ -24,7 +24,9 @@ from src.data.polymarket_feed import (
 from src.data.polymarket_market_resolver import PolymarketMarketResolver, ResolvedMarket
 from src.data.kalshi_feed import KalshiFeed, KalshiOwnFill
 from src.data.unified_book import BookRegistry, MarketState, BookSource
+from src.data.base_feed import FeedHealth, FeedStatus
 from src.pricing.fair_value import FairValueEngine, ASBinaryParams, ParameterCalibrator
+from src.pricing.sizing import compute_order_size_usd
 from src.execution.eip712_signer import EIP712Signer
 from src.execution.order_manager import OrderManager
 from src.execution.order_types import FlickeringFilter
@@ -76,6 +78,9 @@ class Orchestrator:
         # condition_id / kalshi ticker -> our market_id key. Fill events
         # come back keyed by the venue's own identifier, not ours.
         self._condition_to_mid: Dict[str, str] = {}
+        # last FeedHealth seen per feed name, health_queue used to just
+        # get filled and never drained
+        self._feed_health: Dict[str, FeedHealth] = {}
 
     async def run(self) -> None:
         """Start all subsystems and run until kill signal."""
@@ -87,6 +92,7 @@ class Orchestrator:
             asyncio.create_task(self._risk_engine.run(), name="risk"),
             asyncio.create_task(self._calibration_loop(), name="calibrator"),
             asyncio.create_task(self._monitor_kill(),    name="kill_monitor"),
+            asyncio.create_task(self._health_monitor(),  name="health_monitor"),
         ]
         if self._hl_price_feed is not None:
             tasks.append(asyncio.create_task(self._hl_price_feed.run(), name="hl_price_feed"))
@@ -154,22 +160,29 @@ class Orchestrator:
         )
 
         if self._cfg.kalshi:
+            kalshi_rsa = KalshiRsaSigner(self._cfg.kalshi.private_key_pem)
             self._kalshi_order_manager = KalshiOrderManager(
                 http_session=self._http_session,
                 api_key_id=self._cfg.kalshi.api_key_id,
-                rsa_signer=KalshiRsaSigner(self._cfg.kalshi.private_key_pem),
+                rsa_signer=kalshi_rsa,
                 risk_profile=next(iter(self._cfg.markets.values())).risk,
                 rest_url=self._cfg.kalshi_rest_url,
             )
+
+        reconciler = StartupReconciler(self._http_session)
 
         # inventory manager: position size, VWAP cost basis, realized PnL
         self._inventory_mgr = InventoryManager(
             risk_profile=next(iter(self._cfg.markets.values())).risk,
         )
-        if poly_creds:
-            self._inventory_mgr.register_account("polymarket", "pUSD", balance=0.0)
+        if poly_creds and l2_auth is not None:
+            poly_balance = await reconciler.fetch_poly_balance(self._cfg.poly_rest_url, l2_auth)
+            self._inventory_mgr.register_account("polymarket", "pUSD", balance=poly_balance)
         if self._cfg.kalshi:
-            self._inventory_mgr.register_account("kalshi", "USD", balance=0.0)
+            kalshi_balance = await reconciler.fetch_kalshi_balance(
+                self._cfg.kalshi_rest_url, self._cfg.kalshi.api_key_id, kalshi_rsa,
+            )
+            self._inventory_mgr.register_account("kalshi", "USD", balance=kalshi_balance)
 
         # Book registry
         self._book_registry = BookRegistry(self._state_queue)
@@ -195,8 +208,6 @@ class Orchestrator:
         # means InventoryManager starts at zero while the exchange might
         # be holding a real position, and any pre-existing order sits
         # there un-tracked until it fills or someone cancels it by hand.
-        reconciler = StartupReconciler(self._http_session)
-
         if poly_market_ids and poly_creds:
             poly_positions = await reconciler.reconcile_polymarket(
                 wallet_address=self._signer.address,
@@ -212,7 +223,7 @@ class Orchestrator:
             kalshi_positions = await reconciler.reconcile_kalshi(
                 rest_url=self._cfg.kalshi_rest_url,
                 api_key_id=self._cfg.kalshi.api_key_id,
-                rsa_signer=KalshiRsaSigner(self._cfg.kalshi.private_key_pem),
+                rsa_signer=kalshi_rsa,
                 ticker_to_mid=self._condition_to_mid,
             )
             for pos in kalshi_positions:
@@ -451,6 +462,12 @@ class Orchestrator:
 
             # Update quotes (order manager handles cancel/replace)
             if not self._kill_event.is_set():
+                order_size_usd = compute_order_size_usd(
+                    edge_bps=fv.half_spread * 10_000,
+                    sigma=state.realized_vol_1m,
+                    free_collateral_usd=self._inventory_mgr.get_free_collateral(mconf.venue.value),
+                    risk_profile=mconf.risk,
+                )
                 if mconf.venue == Venue.POLYMARKET:
                     resolved = self._resolved_poly.get(mid_id)
                     if resolved is None:
@@ -460,7 +477,7 @@ class Orchestrator:
                         fv=fv,
                         yes_token_id=resolved.yes_token_id,
                         inventory_q=self._inventory_mgr.get_net_qty(mid_id),
-                        order_size_usd=mconf.risk.min_edge_bps * 10,  # size proportional to edge
+                        order_size_usd=order_size_usd,
                         neg_risk=resolved.neg_risk,
                         tick_size=resolved.tick_size,
                     )
@@ -470,7 +487,7 @@ class Orchestrator:
                         fv=fv,
                         ticker=mconf.condition_id,
                         inventory_q=self._inventory_mgr.get_net_qty(mid_id),
-                        order_size_usd=mconf.risk.min_edge_bps * 10,
+                        order_size_usd=order_size_usd,
                     )
 
             # Trigger hedge if needed
@@ -505,7 +522,7 @@ class Orchestrator:
                 )
                 if instr:
                     await self._hedge_engine.execute_hedge(
-                        self._http_session, instr, S_perp
+                        self._http_session, instr, S_perp, sigma_perp
                     )
 
     # Calibration loop
@@ -536,6 +553,51 @@ class Orchestrator:
                 await self._order_manager._cancel_all(mid, reason="kill_switch")
             except Exception:
                 pass
+
+    async def _health_monitor(self) -> None:
+        """
+        Feeds push a FeedHealth snapshot into health_queue on every
+        connect/disconnect/reconnect, this used to just sit there
+        unread. We track the latest per feed and log loudly on anything
+        that isn't "connected and current", a feed silently going stale
+        should not be something you find out about from a P&L gap.
+        """
+        STALE_LAG_MS = 2_000.0
+
+        while not self._kill_event.is_set():
+            try:
+                health: FeedHealth = await asyncio.wait_for(
+                    self._health_queue.get(), timeout=1.0
+                )
+            except asyncio.TimeoutError:
+                continue
+
+            prev = self._feed_health.get(health.venue)
+            self._feed_health[health.venue] = health
+
+            status_changed = prev is None or prev.status != health.status
+            if status_changed and health.status != FeedStatus.CONNECTED:
+                logger.warning(
+                    "feed_status_degraded",
+                    venue=health.venue,
+                    status=health.status.value,
+                    reconnects=health.reconnect_count,
+                    seq_gaps=health.sequence_gaps,
+                )
+            elif status_changed and health.status == FeedStatus.CONNECTED:
+                logger.info("feed_status_recovered", venue=health.venue)
+
+            if health.status == FeedStatus.CONNECTED and health.feed_lag_ms > STALE_LAG_MS:
+                logger.warning(
+                    "feed_lag_high",
+                    venue=health.venue,
+                    lag_ms=round(health.feed_lag_ms, 1),
+                )
+
+    def get_feed_health(self) -> Dict[str, FeedHealth]:
+        """Latest known health per feed, for whatever wants to surface it
+        (a /health endpoint, a dashboard, alerting, take your pick)."""
+        return dict(self._feed_health)
 
     # Shutdown
     async def _shutdown_all(self, tasks) -> None:
