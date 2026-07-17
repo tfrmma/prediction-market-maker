@@ -239,6 +239,7 @@ class OrderManager:
                 if resp.status in (200, 201):
                     body = await resp.json()
                     order_id = body.get("orderID") or body.get("id", "unknown")
+                    status, filled_size = self._resolve_placed_status(body, n_contracts)
                 else:
                     text = await resp.text()
                     self._log.error(
@@ -266,7 +267,8 @@ class OrderManager:
             price=price,
             size=n_contracts,
             placed_ts=time.monotonic(),
-            status=OrderStatus.PENDING,
+            status=status,
+            filled_size=filled_size,
         )
         self._live[(market_id, side_str)] = order
         self._all[order_id] = order
@@ -278,8 +280,34 @@ class OrderManager:
             side=side_str,
             price=round(price, 4),
             size=round(n_contracts, 2),
+            status=status.value,
         )
         return order
+
+    @staticmethod
+    def _resolve_placed_status(body: dict, n_contracts: float) -> Tuple[OrderStatus, float]:
+        """
+        The POST /order response carries a `status` field: "live" (resting,
+        our order made it onto the book), "matched" (filled at placement),
+        or "delayed" (matching engine hasn't decided yet, e.g. RFQ flow).
+        This used to be ignored entirely and every order sat at PENDING
+        forever regardless of what actually happened.
+
+        "matched" doesn't come with a documented partial-fill breakdown
+        we could find, so we treat it as fully filled and log loudly,
+        a post-only order matching at all is already the unexpected case,
+        better to flag it than guess at the fill size.
+        """
+        status = body.get("status", "")
+        if status == "live":
+            return OrderStatus.OPEN, 0.0
+        if status == "matched":
+            logger.warning("postonly_order_matched_at_placement", body=str(body)[:200])
+            return OrderStatus.FILLED, n_contracts
+        if status == "delayed":
+            return OrderStatus.PENDING, 0.0
+        logger.warning("unrecognized_order_status", status=status)
+        return OrderStatus.PENDING, 0.0
 
     async def _cancel_order(self, order: ManagedOrder) -> bool:
         """Cancel a single order.
