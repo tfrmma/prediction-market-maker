@@ -239,6 +239,7 @@ class KalshiOrderManager:
                 if resp.status == 201:
                     body = await resp.json()
                     order_id = body.get("order_id", "unknown")
+                    status, filled_size = self._resolve_placed_status(body, n_contracts)
                 else:
                     text = await resp.text()
                     self._log.error(
@@ -265,7 +266,8 @@ class KalshiOrderManager:
             price=price,
             size=n_contracts,
             placed_ts=time.monotonic(),
-            status=OrderStatus.PENDING,
+            status=status,
+            filled_size=filled_size,
         )
         self._live[(market_id, side_str)] = order
         self._all[order_id] = order
@@ -277,8 +279,30 @@ class KalshiOrderManager:
             side=side_str,
             price=round(price, 4),
             size=n_contracts,
+            status=status.value,
         )
         return order
+
+    @staticmethod
+    def _resolve_placed_status(body: dict, n_contracts: float) -> Tuple[OrderStatus, float]:
+        """
+        Create-order (V2) returns fill_count and remaining_count right in
+        the response, no need to guess or poll for it. Used to just leave
+        every order at PENDING and never move it, this was sitting right
+        there in the response the whole time.
+        """
+        try:
+            fill_count = float(body.get("fill_count", 0))
+            remaining_count = float(body.get("remaining_count", n_contracts))
+        except (TypeError, ValueError):
+            logger.warning("kalshi_order_response_unexpected_shape", body=str(body)[:200])
+            return OrderStatus.PENDING, 0.0
+
+        if remaining_count <= 0 and fill_count > 0:
+            return OrderStatus.FILLED, fill_count
+        if fill_count > 0:
+            return OrderStatus.PARTIAL_FILL, fill_count
+        return OrderStatus.OPEN, 0.0
 
     async def _cancel_order(self, order: ManagedOrder) -> bool:
         url = f"{self._rest_url}/portfolio/orders/{order.order_id}"
