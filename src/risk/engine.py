@@ -336,6 +336,17 @@ class RiskEngine:
                     f"Book stale for {age:.1f}s",
                 )
 
+    def trigger_feed_desync(self, venue: str, detail: str) -> None:
+        """
+        Public entry point for callers outside the normal fill/book-update
+        path to fire STATE_DESYNC directly. `_check_stale_book` only
+        watches a single global timestamp that any venue's traffic
+        refreshes, so one feed going dark while the others keep flowing
+        never trips it. The health monitor tracks per-feed connection
+        state and calls this when a specific feed has been down too long.
+        """
+        self._trigger_kill(KillReason.STATE_DESYNC, f"[{venue}] {detail}")
+
     def _trigger_kill(self, reason: KillReason, detail: str = "") -> None:
         if not self._kill.is_set():
             self._status.kill_active = True
