@@ -38,6 +38,10 @@ class RiskProfile(BaseModel):
     min_edge_bps: float = Field(15.0,  description="Minimum spread capture in bps to quote")
     base_order_size_usd: float = Field(25.0, description="Order size at min_edge_bps / average vol")
     max_order_size_usd: float = Field(150.0, description="Hard ceiling regardless of edge/vol scaling")
+    kelly_fraction_cap: float = Field(0.25, description="Haircut on the fractional-Kelly size cap (0.25 = quarter-Kelly)")
+    max_correlated_exposure_usd: float = Field(
+        1_000.0, description="Cap on combined abs(net_delta_usd) across markets sharing an underlying_symbol"
+    )
     toxic_flow_pause_ms: int  = Field(5_000,  description="Quote freeze ms after toxicity detection")
     flickering_window_ms: int  = Field(500,    description="Window to detect sub-500ms cancel patterns")
     flickering_cancel_threshold: int  = Field(3,      description="N cancels in window → freeze side")
