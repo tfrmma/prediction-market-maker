@@ -11,7 +11,7 @@ import asyncio
 import signal
 import sys
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import aiohttp
 import structlog
@@ -48,6 +48,7 @@ class Orchestrator:
 
     STRATEGY_LOOP_INTERVAL_S: float = 0.1   # 100ms quoting cycle
     CALIBRATION_INTERVAL_S: float  = 300.0  # re-calibrate params every 5 min
+    FEED_DOWN_KILL_THRESHOLD_S: float = 15.0  # a feed dark this long trips the kill switch
 
     def __init__(self, settings: Settings):
         self._cfg         = settings
@@ -337,6 +338,28 @@ class Orchestrator:
         tasks.append(asyncio.create_task(dispatch(), name="dispatch"))
         await asyncio.gather(*tasks)
 
+    def _correlated_exposure_usd(self, market_id: str, underlying_symbol: Optional[str]) -> float:
+        """
+        Sum of abs(net_delta_usd) across every OTHER market that shares
+        this one's underlying_symbol. Two markets on the same underlying
+        aren't independent risk (a BTC-100k market and a BTC-105k market
+        move together), sizing them as if they were understates the real
+        combined exposure. None/"" means no underlying configured, which
+        we treat as uncorrelated with everything, since we have no basis
+        to say otherwise.
+        """
+        if not underlying_symbol:
+            return 0.0
+
+        total = 0.0
+        for other_mid, other_mconf in self._cfg.markets.items():
+            if other_mid == market_id or other_mconf.underlying_symbol != underlying_symbol:
+                continue
+            pos = self._inventory_mgr.get_position(other_mid)
+            if pos is not None:
+                total += abs(pos.net_delta_usd)
+        return total
+
     # Fill dispatch
     def _apply_fill(self, market_id: str, order_id: str, side: str, price: float, size: float) -> None:
         """Shared by both venues: push the fill through OrderManager,
@@ -467,6 +490,7 @@ class Orchestrator:
                     sigma=state.realized_vol_1m,
                     free_collateral_usd=self._inventory_mgr.get_free_collateral(mconf.venue.value),
                     risk_profile=mconf.risk,
+                    correlated_exposure_usd=self._correlated_exposure_usd(mid_id, mconf.underlying_symbol),
                 )
                 if mconf.venue == Venue.POLYMARKET:
                     resolved = self._resolved_poly.get(mid_id)
@@ -557,42 +581,64 @@ class Orchestrator:
     async def _health_monitor(self) -> None:
         """
         Feeds push a FeedHealth snapshot into health_queue on every
-        connect/disconnect/reconnect, this used to just sit there
-        unread. We track the latest per feed and log loudly on anything
-        that isn't "connected and current", a feed silently going stale
-        should not be something you find out about from a P&L gap.
+        connect/disconnect/reconnect. We track the latest per feed, log
+        on any status change, and, if a feed stays down past
+        FEED_DOWN_KILL_THRESHOLD_S, trip the kill switch ourselves.
+
+        `_check_stale_book` on RiskEngine only watches one global
+        timestamp that any venue's traffic refreshes, so Kalshi going
+        dark while Polymarket keeps flowing would never trip it, we'd
+        just keep quoting Kalshi off a book that stopped updating.
+        Per-feed downtime tracking here is what actually catches that.
         """
         STALE_LAG_MS = 2_000.0
+        down_since: Dict[str, float] = {}
+        killed_for: set = set()
 
         while not self._kill_event.is_set():
             try:
                 health: FeedHealth = await asyncio.wait_for(
                     self._health_queue.get(), timeout=1.0
                 )
+                prev = self._feed_health.get(health.venue)
+                self._feed_health[health.venue] = health
+
+                status_changed = prev is None or prev.status != health.status
+                if status_changed and health.status != FeedStatus.CONNECTED:
+                    logger.warning(
+                        "feed_status_degraded",
+                        venue=health.venue,
+                        status=health.status.value,
+                        reconnects=health.reconnect_count,
+                        seq_gaps=health.sequence_gaps,
+                    )
+                elif status_changed and health.status == FeedStatus.CONNECTED:
+                    logger.info("feed_status_recovered", venue=health.venue)
+                    down_since.pop(health.venue, None)
+                    killed_for.discard(health.venue)
+
+                if health.status == FeedStatus.CONNECTED and health.feed_lag_ms > STALE_LAG_MS:
+                    logger.warning(
+                        "feed_lag_high",
+                        venue=health.venue,
+                        lag_ms=round(health.feed_lag_ms, 1),
+                    )
+
+                if health.status != FeedStatus.CONNECTED:
+                    down_since.setdefault(health.venue, time.monotonic())
+
             except asyncio.TimeoutError:
-                continue
+                pass   # still fall through to the downtime check below
 
-            prev = self._feed_health.get(health.venue)
-            self._feed_health[health.venue] = health
-
-            status_changed = prev is None or prev.status != health.status
-            if status_changed and health.status != FeedStatus.CONNECTED:
-                logger.warning(
-                    "feed_status_degraded",
-                    venue=health.venue,
-                    status=health.status.value,
-                    reconnects=health.reconnect_count,
-                    seq_gaps=health.sequence_gaps,
-                )
-            elif status_changed and health.status == FeedStatus.CONNECTED:
-                logger.info("feed_status_recovered", venue=health.venue)
-
-            if health.status == FeedStatus.CONNECTED and health.feed_lag_ms > STALE_LAG_MS:
-                logger.warning(
-                    "feed_lag_high",
-                    venue=health.venue,
-                    lag_ms=round(health.feed_lag_ms, 1),
-                )
+            now = time.monotonic()
+            for venue, since in down_since.items():
+                downtime = now - since
+                if downtime > self.FEED_DOWN_KILL_THRESHOLD_S and venue not in killed_for:
+                    killed_for.add(venue)
+                    self._risk_engine.trigger_feed_desync(
+                        venue,
+                        f"down for {downtime:.1f}s (threshold {self.FEED_DOWN_KILL_THRESHOLD_S:.0f}s)",
+                    )
 
     def get_feed_health(self) -> Dict[str, FeedHealth]:
         """Latest known health per feed, for whatever wants to surface it
