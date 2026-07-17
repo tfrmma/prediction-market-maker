@@ -247,6 +247,8 @@ Note that YES/NO token ids, `neg_risk`, and tick size are **not** configured man
 | `min_edge_bps` | 15 | Don't quote below 15 bps edge |
 | `base_order_size_usd` | 25 | Order size at min_edge_bps / average vol |
 | `max_order_size_usd` | 150 | Hard ceiling regardless of edge/vol scaling |
+| `kelly_fraction_cap` | 0.25 | Haircut on the fractional-Kelly size cap (quarter-Kelly) |
+| `max_correlated_exposure_usd` | 1 000 | Cap on combined exposure across markets sharing an `underlying_symbol` |
 | `toxic_flow_pause_ms` | 5 000 | Quote freeze after toxicity trigger |
 | `flickering_window_ms` | 500 | Window for cancel pattern detection |
 | `flickering_cancel_threshold` | 3 | Cancels in window triggers a freeze |
@@ -306,7 +308,7 @@ pytest tests/test_core.py -v
 pytest tests/test_core.py --cov=src --cov-report=term-missing
 ```
 
-49 tests across fourteen classes:
+54 tests across fifteen classes:
 
 | Class | What it covers |
 |---|---|
@@ -320,10 +322,11 @@ pytest tests/test_core.py --cov=src --cov-report=term-missing
 | `TestPolymarketMarketResolver` | YES/NO token id extraction from the `/markets/{condition_id}` response shape |
 | `TestKalshiOrderManagerWireFormat` | BUY/SELL to bid/ask side mapping |
 | `TestRoundToTick` | Price snapping to the resolved tick size |
-| `TestOrderSizing` | Zero-edge floor, free-collateral budget cap, hard ceiling, vol dampening |
+| `TestOrderSizing` | Zero-edge floor, free-collateral budget cap, hard ceiling, vol dampening, Kelly cap, correlated-exposure cap |
 | `TestHedgeSlippage` | No-data floor fallback, vol widens the crossing buffer, ceiling clamp |
 | `TestSecretsLoader` | Plain env var fallback, AWS Secrets Manager path when an ARN is configured |
 | `TestOrderStatusResolution` | Placement-response status mapping to OPEN/FILLED/PARTIAL_FILL/PENDING on both venues |
+| `TestFeedDesyncKillSwitch` | `trigger_feed_desync` actually flips `kill_event`, second trigger is a no-op |
 
 ## Kill switch
 
@@ -336,7 +339,7 @@ Kill switch triggers (any one fires it):
 | Drawdown | Intraday PnL < `-intraday_drawdown_limit` |
 | Loss rate | Loss > `loss_rate_limit_15m` within any rolling 15-minute window |
 | API failure | 3 or more consecutive order API failures |
-| State desync | No book update for more than 10 seconds |
+| State desync | No book update for more than 10 seconds, or a single feed down for more than `FEED_DOWN_KILL_THRESHOLD_S` (15s) while others keep flowing |
 | Latency spike | Fill latency more than 5x the rolling median |
 | Manual | `SIGINT` / `SIGTERM` |
 
@@ -351,12 +354,9 @@ If the process restarts with resting orders still live on either exchange, start
 
 ## What's left
 
-Closed in this revision: real Polymarket CLOB V2 signing (6-decimal amounts, correct domain, neg-risk routing), L2 HMAC auth on every authenticated request, Kalshi's bids-only book (was getting parsed like it had a real ask side), a full Kalshi execution engine that didn't exist before, real Hyperliquid phantom-agent signing (was a placeholder that never actually signed anything), a live Hyperliquid price/vol feed instead of a hardcoded constant, the own-fill feedback loop on both venues, post-only and tick-size rounding on both venues, a symmetric self-trade guard, startup reconciliation, order sizing tied to edge/vol/free collateral instead of a made-up constant, a `health_queue` that actually gets read, Kalshi's PEM off a secrets manager when you want it, hedge slippage that scales with real vol instead of a flat 0.5%, and order status resolution off the placement response (`PENDING` used to never move to `OPEN`/`FILLED`/`PARTIAL_FILL`, the data was in the response the whole time).
+Closed in this revision: real Polymarket CLOB V2 signing (6-decimal amounts, correct domain, neg-risk routing), L2 HMAC auth on every authenticated request, Kalshi's bids-only book (was getting parsed like it had a real ask side), a full Kalshi execution engine that didn't exist before, real Hyperliquid phantom-agent signing (was a placeholder that never actually signed anything), a live Hyperliquid price/vol feed instead of a hardcoded constant, the own-fill feedback loop on both venues, post-only and tick-size rounding on both venues, a symmetric self-trade guard, startup reconciliation, order sizing tied to edge/vol/free collateral instead of a made-up constant, a `health_queue` that actually gets read, Kalshi's PEM off a secrets manager when you want it, hedge slippage that scales with real vol instead of a flat 0.5%, order status resolution off the placement response (`PENDING` used to never move to `OPEN`/`FILLED`/`PARTIAL_FILL`), a fractional-Kelly cap and cross-market correlated-exposure awareness in the sizing model, and a `_health_monitor` that trips the kill switch itself when a single feed stays down past `FEED_DOWN_KILL_THRESHOLD_S` (15s default) instead of just logging it.
 
-Still on the list:
-
-- **Sizing is bounded, not smart.** It won't blow through your risk budget anymore, but it's not Kelly-sized and doesn't know about correlation across markets.
-- **`_health_monitor` logs, it doesn't act.** A feed going quiet gets logged loudly but doesn't trip the kill switch on its own, that's still `RiskEngine`'s staleness check running on its own clock.
+Nothing left on the list right now. If you find something, it's probably in a part of the flow nobody's traded through yet.
 
 ## Design decisions
 
