@@ -526,6 +526,59 @@ class TestRoundToTick:
         assert round_to_tick(0.56, 0.01) == 0.56
 
 
+class TestOrderStatusResolution:
+    """Placed orders used to sit at PENDING forever, the placement
+    response has the real status right there, this just stops throwing
+    it away."""
+
+    def test_polymarket_live_maps_to_open(self):
+        from src.execution.order_manager import OrderManager
+        from src.execution.order_types import OrderStatus
+        status, filled = OrderManager._resolve_placed_status({"status": "live"}, 10.0)
+        assert status == OrderStatus.OPEN
+        assert filled == 0.0
+
+    def test_polymarket_matched_maps_to_filled(self):
+        from src.execution.order_manager import OrderManager
+        from src.execution.order_types import OrderStatus
+        status, filled = OrderManager._resolve_placed_status({"status": "matched"}, 10.0)
+        assert status == OrderStatus.FILLED
+        assert filled == 10.0
+
+    def test_polymarket_delayed_stays_pending(self):
+        from src.execution.order_manager import OrderManager
+        from src.execution.order_types import OrderStatus
+        status, _ = OrderManager._resolve_placed_status({"status": "delayed"}, 10.0)
+        assert status == OrderStatus.PENDING
+
+    def test_kalshi_no_fill_maps_to_open(self):
+        from src.execution.kalshi_order_manager import KalshiOrderManager
+        from src.execution.order_types import OrderStatus
+        status, filled = KalshiOrderManager._resolve_placed_status(
+            {"fill_count": 0, "remaining_count": 10}, 10.0
+        )
+        assert status == OrderStatus.OPEN
+        assert filled == 0.0
+
+    def test_kalshi_full_fill_at_placement(self):
+        from src.execution.kalshi_order_manager import KalshiOrderManager
+        from src.execution.order_types import OrderStatus
+        status, filled = KalshiOrderManager._resolve_placed_status(
+            {"fill_count": 10, "remaining_count": 0}, 10.0
+        )
+        assert status == OrderStatus.FILLED
+        assert filled == 10.0
+
+    def test_kalshi_partial_fill_at_placement(self):
+        from src.execution.kalshi_order_manager import KalshiOrderManager
+        from src.execution.order_types import OrderStatus
+        status, filled = KalshiOrderManager._resolve_placed_status(
+            {"fill_count": 4, "remaining_count": 6}, 10.0
+        )
+        assert status == OrderStatus.PARTIAL_FILL
+        assert filled == 4.0
+
+
 class TestOrderSizing:
     """order_size_usd used to be min_edge_bps * 10, no relationship to
     risk, vol, or actual capital. These pin down the bounds it's now
