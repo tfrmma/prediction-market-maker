@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import os
 from enum import Enum
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings  # pydantic v2 compat shim
 
 from config.secrets import load_secret
@@ -81,6 +81,39 @@ class MarketConfig(BaseModel):
     hedge: HedgeProfile = Field(default_factory=HedgeProfile)
 
 
+# Event Group Configuration (categorical / N-outcome markets)
+class EventGroupConfig(BaseModel):
+    """
+    Ties together the N mutually-exclusive outcome markets of a single
+    event, e.g. a 6-candidate election or a "who wins the tournament"
+    market. Each outcome_id must be a key in Settings.markets, same as
+    any standalone binary market.
+
+    We don't try to verify exhaustiveness/exclusivity ourselves, that's
+    a property of how the venue structured the market and we just trust
+    it (same assumption unified_book.py already makes for YES/NO).
+    What we do check is internal consistency of the config itself, see
+    Settings.validate_event_groups below, this only validates group
+    shape.
+    """
+    event_id: str
+    outcome_ids: List[str]      # market_id (condition_id/ticker) per outcome, len >= 2
+    venue: Venue
+    resolution_ts: int           # must match every member MarketConfig
+    correlation_window_s: float = Field(
+        1800.0, description="EWMA window (seconds) for the cross-outcome covariance estimator"
+    )
+
+    @field_validator("outcome_ids")
+    @classmethod
+    def validate_outcome_ids(cls, v: List[str]) -> List[str]:
+        if len(v) < 2:
+            raise ValueError("event group needs at least 2 outcomes, otherwise it's just a binary market")
+        if len(set(v)) != len(v):
+            raise ValueError(f"duplicate outcome_ids in event group: {v}")
+        return v
+
+
 # API Credentials
 class PolymarketCredentials(BaseModel):
     api_key: str    = Field(default_factory=lambda: os.environ["POLY_API_KEY"])
@@ -132,6 +165,11 @@ class Settings(BaseModel):
     # Markets to make
     markets: Dict[str, MarketConfig] = Field(default_factory=dict)
 
+    # Categorical event groups (N mutually-exclusive outcomes). Every
+    # outcome_id referenced here must also exist in `markets` above,
+    # a group doesn't replace the per-market config, it just links them.
+    event_groups: Dict[str, EventGroupConfig] = Field(default_factory=dict)
+
     # Global kill switch
     kill_switch_active: bool = False
 
@@ -146,6 +184,39 @@ class Settings(BaseModel):
     def validate_env(cls, v: str) -> str:
         assert v in {"production", "staging", "backtest"}, f"Unknown env: {v}"
         return v
+
+    @model_validator(mode="after")
+    def validate_event_groups(self) -> "Settings":
+        seen_outcomes: Dict[str, str] = {}   # market_id -> event_id, to catch double-membership
+
+        for event_id, group in self.event_groups.items():
+            if event_id != group.event_id:
+                raise ValueError(f"event_groups key '{event_id}' != group.event_id '{group.event_id}'")
+
+            for market_id in group.outcome_ids:
+                mconf = self.markets.get(market_id)
+                if mconf is None:
+                    raise ValueError(f"event group '{event_id}': outcome '{market_id}' not in markets")
+
+                if market_id in seen_outcomes:
+                    raise ValueError(
+                        f"market '{market_id}' claimed by both event groups "
+                        f"'{seen_outcomes[market_id]}' and '{event_id}'"
+                    )
+                seen_outcomes[market_id] = event_id
+
+                if mconf.venue != group.venue:
+                    raise ValueError(
+                        f"event group '{event_id}': outcome '{market_id}' venue "
+                        f"{mconf.venue} != group venue {group.venue}"
+                    )
+                if mconf.resolution_ts != group.resolution_ts:
+                    raise ValueError(
+                        f"event group '{event_id}': outcome '{market_id}' resolution_ts "
+                        f"{mconf.resolution_ts} != group resolution_ts {group.resolution_ts}"
+                    )
+
+        return self
 
 
 # Module-level singleton , import this everywhere
