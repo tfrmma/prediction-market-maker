@@ -9,6 +9,7 @@ from src.data.unified_book import L2Book, UnifiedBook, BookSource
 from src.data.polymarket_feed import PolyBookSnapshot, PriceLevel, PolyTrade
 from src.pricing.fair_value import FairValueEngine, ASBinaryParams
 from src.execution.eip712_signer import EIP712Signer, OrderParams, OrderSide
+from config.settings import Settings, MarketConfig, EventGroupConfig, Venue
 
 
 # L2Book
@@ -676,3 +677,97 @@ class TestSecretsLoader:
         monkeypatch.setenv("TEST_SECRET_ARN", "arn:aws:secretsmanager:...:secret:x")
 
         assert secrets_mod.load_secret("TEST_SECRET_PLAIN", "TEST_SECRET_ARN") == "from-aws"
+
+
+# EventGroupConfig
+class TestEventGroupConfig:
+    """First piece of the categorical (N-outcome) market maker: just the
+    config-level plumbing that ties outcome markets to an event and
+    catches inconsistent setups before anything gets near the strategy
+    loop."""
+
+    def _markets(self, n=3, resolution_ts=1_800_000_000):
+        return {
+            f"OUT-{i}": MarketConfig(condition_id=f"OUT-{i}", venue=Venue.KALSHI, resolution_ts=resolution_ts)
+            for i in range(n)
+        }
+
+    def test_valid_group_attaches_fine(self):
+        markets = self._markets(4)
+        group = EventGroupConfig(
+            event_id="EVT",
+            outcome_ids=list(markets.keys()),
+            venue=Venue.KALSHI,
+            resolution_ts=1_800_000_000,
+        )
+        s = Settings(markets=markets, event_groups={"EVT": group})
+        assert s.event_groups["EVT"].outcome_ids == list(markets.keys())
+
+    def test_rejects_single_outcome(self):
+        with pytest.raises(Exception):
+            EventGroupConfig(event_id="EVT", outcome_ids=["OUT-0"], venue=Venue.KALSHI, resolution_ts=1)
+
+    def test_rejects_duplicate_outcome_in_same_group(self):
+        with pytest.raises(Exception):
+            EventGroupConfig(
+                event_id="EVT", outcome_ids=["OUT-0", "OUT-0"], venue=Venue.KALSHI, resolution_ts=1
+            )
+
+    def test_rejects_outcome_not_in_markets(self):
+        markets = self._markets(2)
+        group = EventGroupConfig(
+            event_id="EVT", outcome_ids=["OUT-0", "GHOST"], venue=Venue.KALSHI, resolution_ts=1_800_000_000
+        )
+        with pytest.raises(Exception):
+            Settings(markets=markets, event_groups={"EVT": group})
+
+    def test_rejects_venue_mismatch_with_member(self):
+        markets = self._markets(2)
+        group = EventGroupConfig(
+            event_id="EVT",
+            outcome_ids=list(markets.keys()),
+            venue=Venue.POLYMARKET,   # markets above are all Kalshi
+            resolution_ts=1_800_000_000,
+        )
+        with pytest.raises(Exception):
+            Settings(markets=markets, event_groups={"EVT": group})
+
+    def test_rejects_resolution_ts_mismatch_with_member(self):
+        markets = self._markets(2, resolution_ts=1_800_000_000)
+        group = EventGroupConfig(
+            event_id="EVT",
+            outcome_ids=list(markets.keys()),
+            venue=Venue.KALSHI,
+            resolution_ts=1_900_000_000,   # doesn't match the markets
+        )
+        with pytest.raises(Exception):
+            Settings(markets=markets, event_groups={"EVT": group})
+
+    def test_rejects_market_claimed_by_two_groups(self):
+        """A market_id can only belong to one categorical event, otherwise
+        the covariance estimator we add later doesn't know which basket
+        it's supposed to net against."""
+        markets = self._markets(3)   # OUT-0, OUT-1, OUT-2
+        markets["OUT-3"] = MarketConfig(condition_id="OUT-3", venue=Venue.KALSHI, resolution_ts=1_800_000_000)
+
+        group_a = EventGroupConfig(
+            event_id="A", outcome_ids=["OUT-0", "OUT-1"], venue=Venue.KALSHI, resolution_ts=1_800_000_000
+        )
+        group_b = EventGroupConfig(
+            event_id="B", outcome_ids=["OUT-1", "OUT-3"], venue=Venue.KALSHI, resolution_ts=1_800_000_000
+        )
+        with pytest.raises(Exception):
+            Settings(markets=markets, event_groups={"A": group_a, "B": group_b})
+
+    def test_event_groups_key_must_match_event_id(self):
+        markets = self._markets(2)
+        group = EventGroupConfig(
+            event_id="EVT-REAL", outcome_ids=list(markets.keys()), venue=Venue.KALSHI, resolution_ts=1_800_000_000
+        )
+        with pytest.raises(Exception):
+            Settings(markets=markets, event_groups={"EVT-WRONG-KEY": group})
+
+    def test_default_settings_has_no_event_groups(self):
+        """Existing binary-only configs shouldn't need to know this exists."""
+        s = Settings(markets=self._markets(1))
+        assert s.event_groups == {}
