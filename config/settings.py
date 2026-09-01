@@ -83,19 +83,9 @@ class MarketConfig(BaseModel):
 
 # Event Group Configuration (categorical / N-outcome markets)
 class EventGroupConfig(BaseModel):
-    """
-    Ties together the N mutually-exclusive outcome markets of a single
-    event, e.g. a 6-candidate election or a "who wins the tournament"
-    market. Each outcome_id must be a key in Settings.markets, same as
-    any standalone binary market.
-
-    We don't try to verify exhaustiveness/exclusivity ourselves, that's
-    a property of how the venue structured the market and we just trust
-    it (same assumption unified_book.py already makes for YES/NO).
-    What we do check is internal consistency of the config itself, see
-    Settings.validate_event_groups below, this only validates group
-    shape.
-    """
+    """N mutually-exclusive outcomes of one event. outcome_ids must exist
+    in Settings.markets. We don't verify exhaustiveness, that's on the
+    venue, just internal consistency (see validate_event_groups below)."""
     event_id: str
     outcome_ids: List[str]      # market_id (condition_id/ticker) per outcome, len >= 2
     venue: Venue
