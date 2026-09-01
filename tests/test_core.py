@@ -16,6 +16,10 @@ from src.pricing.covariance import (
     multinomial_structural_covariance,
     structural_probability_covariance,
 )
+from src.pricing.categorical_fair_value import (
+    CategoricalFairValueEngine,
+    CategoricalASParams,
+)
 from config.settings import Settings, MarketConfig, EventGroupConfig, Venue
 
 
@@ -975,3 +979,102 @@ class TestCategoricalCovarianceEstimator:
         cold_prior = structural_probability_covariance({"A": 0.4, "B": 0.6}, ["A", "B"], "B")
         assert sigma.shape == cold_prior.shape
         assert est.alr_covariance() is not None
+
+
+# CategoricalFairValueEngine
+class TestCategoricalFairValueEngine:
+
+    def _basket(self, p_mids: Dict[str, float], cvd: Dict[str, float] = None,
+                imbalance: Dict[str, float] = None, ttres_s=86400, book_ts_ms=None, ts=None):
+        from src.data.unified_book import MarketState
+        cvd = cvd or {}
+        imbalance = imbalance or {}
+        ts = ts if ts is not None else time.monotonic()
+        bts = book_ts_ms if book_ts_ms is not None else int(time.time() * 1000)
+
+        outcomes = {}
+        for oid, p in p_mids.items():
+            outcomes[oid] = MarketState(
+                market_id=oid, source=BookSource.POLYMARKET, ts=ts,
+                p_mid=p, p_bid=p - 0.01, p_ask=p + 0.01, spread=0.02,
+                cvd=cvd.get(oid, 0.0), imbalance=imbalance.get(oid, 0.0),
+                resolution_ts=int(time.time() + ttres_s), time_to_resolution_s=float(ttres_s),
+                book_ts_ms=bts,
+            )
+        sum_mid = sum(p_mids.values())
+        return CategoricalMarketState(
+            event_id="EVT", ts=ts, outcomes=outcomes,
+            sum_p_bid=sum_mid - 0.01 * len(p_mids),
+            sum_p_ask=sum_mid + 0.01 * len(p_mids),
+            sum_p_mid=sum_mid,
+        )
+
+    def test_p_fair_always_sums_to_one(self):
+        engine = CategoricalFairValueEngine()
+        # deliberately inconsistent book, sums to 1.2
+        basket = self._basket({"A": 0.5, "B": 0.4, "C": 0.3})
+        result = engine.compute(basket, CategoricalASParams())
+        assert sum(result.p_fair.values()) == pytest.approx(1.0, abs=1e-9)
+
+    def test_zero_flow_reduces_to_proportional_renormalization(self):
+        engine = CategoricalFairValueEngine()
+        p_mids = {"A": 0.5, "B": 0.3, "C": 0.2}   # already sums to 1
+        basket = self._basket(p_mids)
+        result = engine.compute(basket, CategoricalASParams(alpha=0.0, beta=0.0))
+        total = sum(p_mids.values())
+        for oid, p in p_mids.items():
+            assert result.p_fair[oid] == pytest.approx(p / total, abs=1e-9)
+
+    def test_n2_softmax_equals_sigmoid_of_score_difference(self):
+        engine = CategoricalFairValueEngine()
+        basket = self._basket({"A": 0.62, "B": 0.30}, cvd={"A": 50.0})
+        result = engine.compute(basket, CategoricalASParams())
+        diff = result.scores["A"] - result.scores["B"]
+        expected_a = 1.0 / (1.0 + math.exp(-diff))
+        assert result.p_fair["A"] == pytest.approx(expected_a, abs=1e-9)
+
+    def test_positive_cvd_increases_that_outcomes_share(self):
+        engine = CategoricalFairValueEngine()
+        even = self._basket({"A": 1 / 3, "B": 1 / 3, "C": 1 / 3})
+        skewed = self._basket({"A": 1 / 3, "B": 1 / 3, "C": 1 / 3}, cvd={"A": 200.0})
+        r_even = engine.compute(even, CategoricalASParams())
+        r_skewed = engine.compute(skewed, CategoricalASParams())
+        assert r_skewed.p_fair["A"] > r_even.p_fair["A"]
+        # mass has to come from somewhere, siblings should drop
+        assert r_skewed.p_fair["B"] < r_even.p_fair["B"]
+
+    def test_flow_adjustment_is_clipped(self):
+        engine = CategoricalFairValueEngine()
+        basket = self._basket({"A": 0.5, "B": 0.5}, cvd={"A": 1e6})
+        params = CategoricalASParams(max_flow_adj=1.5)
+        result = engine.compute(basket, params)
+        assert abs(result.flow_adjustment["A"]) <= 1.5 + 1e-9
+
+    def test_prelec_correction_pulls_longshot_probability_down(self):
+        engine = CategoricalFairValueEngine()
+        basket = self._basket({"A": 0.90, "B": 0.05, "C": 0.05})
+        params = CategoricalASParams(prelec_kappa={"B": 0.7})
+        result = engine.compute(basket, params)
+        assert result.p_base["B"] < 0.05
+        assert result.p_base["A"] == pytest.approx(0.90)   # untouched, no kappa given
+
+    def test_should_quote_false_when_basket_invalid(self):
+        engine = CategoricalFairValueEngine()
+        basket = self._basket({"A": 0.5, "B": 0.5}, ttres_s=86400)
+        basket.outcomes["A"].p_bid, basket.outcomes["A"].p_ask = 0.6, 0.4  # crossed
+        result = engine.compute(basket, CategoricalASParams())
+        assert result.should_quote is False
+
+    def test_should_quote_false_when_near_resolution(self):
+        engine = CategoricalFairValueEngine()
+        basket = self._basket({"A": 0.5, "B": 0.5}, ttres_s=60)   # 1 min out
+        result = engine.compute(basket, CategoricalASParams(min_ttres_s=3600.0))
+        assert result.should_quote is False
+
+    def test_is_stale_true_when_book_old(self):
+        engine = CategoricalFairValueEngine()
+        old_ts_ms = int((time.time() - 30.0) * 1000)   # 30s old
+        basket = self._basket({"A": 0.5, "B": 0.5}, book_ts_ms=old_ts_ms)
+        result = engine.compute(basket, CategoricalASParams())
+        assert result.is_stale is True
+        assert result.should_quote is False
