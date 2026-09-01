@@ -1175,3 +1175,48 @@ class TestCategoricalSkewEngine:
         fv_result, quote = self._compute({"A": 0.5, "B": 0.5}, {}, ttres_s=60)
         assert fv_result.should_quote is False
         assert quote.should_quote is False
+
+
+# Orchestrator._to_fair_value_result (categorical -> binary adapter)
+class TestOrchestratorCategoricalAdapter:
+    """update_quotes() in order_manager.py / kalshi_order_manager.py only
+    ever reads should_quote/bid_quote/ask_quote/half_spread off whatever
+    it's handed, this is the seam that lets categorical outcomes reuse
+    that code unchanged, worth testing on its own."""
+
+    def test_adapter_pulls_correct_outcome_slice(self):
+        from src.main import Orchestrator
+        from src.pricing.categorical_fair_value import CategoricalFairValueResult
+        from src.pricing.categorical_skew import CategoricalQuoteResult
+
+        fv_result = CategoricalFairValueResult(
+            event_id="EVT", ts=0.0,
+            p_fair={"A": 0.6, "B": 0.4}, p_base={"A": 0.6, "B": 0.4},
+            scores={"A": -0.5, "B": -0.9}, flow_adjustment={"A": 0.0, "B": 0.0},
+            should_quote=True, is_stale=False,
+        )
+        quote = CategoricalQuoteResult(
+            event_id="EVT", ts=0.0,
+            p_reservation={"A": 0.58, "B": 0.42},
+            inventory_skew={"A": -0.02, "B": 0.02},
+            marginal_variance={"A": 0.24, "B": 0.24},
+            half_spread={"A": 0.03, "B": 0.025},
+            bid_quote={"A": 0.55, "B": 0.395},
+            ask_quote={"A": 0.61, "B": 0.445},
+            should_quote=True,
+        )
+
+        fv_a = Orchestrator._to_fair_value_result("A", fv_result, quote, ttres_s=3600.0)
+        assert fv_a.market_id == "A"
+        assert fv_a.p_fair == 0.6
+        assert fv_a.bid_quote == 0.55
+        assert fv_a.ask_quote == 0.61
+        assert fv_a.half_spread == 0.03
+        assert fv_a.inventory_skew == -0.02
+        assert fv_a.should_quote is True
+        assert fv_a.is_stale is False
+
+        fv_b = Orchestrator._to_fair_value_result("B", fv_result, quote, ttres_s=3600.0)
+        assert fv_b.market_id == "B"
+        assert fv_b.bid_quote == 0.395
+        assert fv_b.ask_quote == 0.445
