@@ -52,6 +52,14 @@ class CategoricalASParams:
     max_flow_adj: float = 2.0   # clip |alpha*cvd + beta*ofi| before it hits the softmax
     min_ttres_s: float = 3600.0
 
+    # Inventory skew / spread (see categorical_skew.py)
+    gamma: float = 0.05
+    k: float = 1.5                                  # default arrival intensity
+    k_per_outcome: Dict[str, float] = field(default_factory=dict)
+    min_half_spread: float = 0.005
+    max_half_spread: float = 0.08
+    max_skew: float = 0.10
+
     # Per-outcome Prelec kappa (Kalshi longshot bias), keyed by outcome_id.
     # Outcomes not present here get no bias correction.
     prelec_kappa: Dict[str, float] = field(default_factory=dict)
