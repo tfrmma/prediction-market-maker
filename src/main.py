@@ -25,8 +25,12 @@ from src.data.polymarket_market_resolver import PolymarketMarketResolver, Resolv
 from src.data.kalshi_feed import KalshiFeed, KalshiOwnFill
 from src.data.unified_book import BookRegistry, MarketState, BookSource
 from src.data.base_feed import FeedHealth, FeedStatus
-from src.pricing.fair_value import FairValueEngine, ASBinaryParams, ParameterCalibrator
+from src.pricing.fair_value import FairValueEngine, ASBinaryParams, ParameterCalibrator, FairValueResult
 from src.pricing.sizing import compute_order_size_usd
+from src.data.categorical_book import CategoricalBookAggregator
+from src.pricing.covariance import CategoricalCovarianceEstimator
+from src.pricing.categorical_fair_value import CategoricalFairValueEngine, CategoricalASParams
+from src.pricing.categorical_skew import CategoricalSkewEngine
 from src.execution.eip712_signer import EIP712Signer
 from src.execution.order_manager import OrderManager
 from src.execution.order_types import FlickeringFilter
@@ -63,9 +67,20 @@ class Orchestrator:
         self._params:    Dict[str, ASBinaryParams] = {}
         self._calibrators: Dict[str, ParameterCalibrator] = {}
 
+        # Categorical (N-outcome) events, keyed by event_id. market_to_event
+        # is the reverse lookup the strategy loop uses to route a single
+        # outcome's update through the basket pipeline instead of the
+        # per-market binary one, see _handle_categorical_update.
+        self._market_to_event: Dict[str, str] = {}
+        self._categorical_aggregators: Dict[str, CategoricalBookAggregator] = {}
+        self._categorical_cov: Dict[str, CategoricalCovarianceEstimator] = {}
+        self._categorical_params: Dict[str, CategoricalASParams] = {}
+
         # Core components (initialized in setup())
         self._book_registry: BookRegistry = None
         self._pricing_engine = FairValueEngine()
+        self._categorical_fv_engine = CategoricalFairValueEngine()
+        self._categorical_skew_engine = CategoricalSkewEngine()
         self._risk_engine:   RiskEngine = None
         self._order_manager: OrderManager = None
         self._kalshi_order_manager: KalshiOrderManager = None
@@ -197,6 +212,20 @@ class Orchestrator:
             self._last_mid[mid]  = 0.0
             self._params[mid]    = ASBinaryParams()
             self._calibrators[mid] = ParameterCalibrator(ASBinaryParams())
+
+        # Categorical event groups: build one aggregator + covariance
+        # estimator per event, and point every member outcome at its
+        # event_id so the strategy loop knows to route it differently.
+        for event_id, group in self._cfg.event_groups.items():
+            self._categorical_aggregators[event_id] = CategoricalBookAggregator(
+                event_id, group.outcome_ids,
+            )
+            self._categorical_cov[event_id] = CategoricalCovarianceEstimator(
+                event_id, group.outcome_ids, correlation_window_s=group.correlation_window_s,
+            )
+            self._categorical_params[event_id] = CategoricalASParams()
+            for mid in group.outcome_ids:
+                self._market_to_event[mid] = event_id
 
         # Risk engine
         self._risk_engine = RiskEngine(
@@ -429,7 +458,10 @@ class Orchestrator:
 
     # Strategy loop
     async def _strategy_loop(self) -> None:
-        """Main quoting loop, drains state_queue and updates quotes per market."""
+        """Main quoting loop, drains state_queue and updates quotes per
+        market. Markets belonging to an EventGroupConfig get routed
+        through the categorical (softmax + multi-asset skew) pipeline
+        instead, see _handle_categorical_update."""
         while not self._kill_event.is_set():
             try:
                 state: MarketState = await asyncio.wait_for(
@@ -446,9 +478,15 @@ class Orchestrator:
             if mconf is None:
                 continue
 
-            # Update risk engine mark + inventory mark-to-market
+            # Update risk engine mark + inventory mark-to-market, same for
+            # every market regardless of which pricing engine handles it
             self._risk_engine.on_market_update(mid_id, state.p_mid)
             self._inventory_mgr.update_mid(mid_id, state.p_mid)
+
+            event_id = self._market_to_event.get(mid_id)
+            if event_id is not None:
+                await self._handle_categorical_update(event_id, mid_id, state)
+                continue
 
             # Flow delta for calibration
             prev_mid = self._last_mid.get(mid_id, state.p_mid)
@@ -483,71 +521,142 @@ class Orchestrator:
                 ofi=round(state.ofi, 5),
             )
 
-            # Update quotes (order manager handles cancel/replace)
-            if not self._kill_event.is_set():
-                order_size_usd = compute_order_size_usd(
-                    edge_bps=fv.half_spread * 10_000,
-                    sigma=state.realized_vol_1m,
-                    free_collateral_usd=self._inventory_mgr.get_free_collateral(mconf.venue.value),
-                    risk_profile=mconf.risk,
-                    correlated_exposure_usd=self._correlated_exposure_usd(mid_id, mconf.underlying_symbol),
-                )
-                if mconf.venue == Venue.POLYMARKET:
-                    resolved = self._resolved_poly.get(mid_id)
-                    if resolved is None:
-                        continue  # never resolved at startup, can't quote safely
-                    await self._order_manager.update_quotes(
-                        state=state,
-                        fv=fv,
-                        yes_token_id=resolved.yes_token_id,
-                        inventory_q=self._inventory_mgr.get_net_qty(mid_id),
-                        order_size_usd=order_size_usd,
-                        neg_risk=resolved.neg_risk,
-                        tick_size=resolved.tick_size,
-                    )
-                elif self._kalshi_order_manager:
-                    await self._kalshi_order_manager.update_quotes(
-                        state=state,
-                        fv=fv,
-                        ticker=mconf.condition_id,
-                        inventory_q=self._inventory_mgr.get_net_qty(mid_id),
-                        order_size_usd=order_size_usd,
-                    )
+            await self._place_quotes_and_hedge(mid_id, mconf, state, fv)
 
-            # Trigger hedge if needed
-            if self._hedge_engine and mconf.hedge.enabled and mconf.underlying_symbol:
-                coin = mconf.underlying_symbol
-                S_perp = self._hl_price_feed.get_mid(coin) if self._hl_price_feed else None
-                sigma_perp = self._hl_price_feed.get_realized_vol(coin) if self._hl_price_feed else None
-                K_strike = mconf.underlying_strike
+    async def _handle_categorical_update(self, event_id: str, mid_id: str, state: MarketState) -> None:
+        """One outcome's update, buffered until every outcome in the event
+        has reported at least once, then the whole basket is priced and
+        quoted together so the N outcomes stay consistent."""
+        basket = self._categorical_aggregators[event_id].update(mid_id, state)
+        if basket is None:
+            return   # still waiting on the rest of this event's outcomes
 
-                if S_perp is None or sigma_perp is None or K_strike is None:
-                    # missing live price, not enough vol history yet, or no
-                    # strike configured for this market, skip rather than
-                    # hedge off a guess
-                    logger.debug(
-                        "hedge_skipped_missing_data",
-                        market_id=mid_id,
-                        has_price=S_perp is not None,
-                        has_vol=sigma_perp is not None,
-                        has_strike=K_strike is not None,
-                    )
-                    continue
+        cov_est = self._categorical_cov[event_id]
+        cov_est.observe(basket)
 
-                instr = await self._hedge_engine.compute_and_hedge(
-                    market_id=mid_id,
+        params = self._categorical_params[event_id]
+        fv_result = self._categorical_fv_engine.compute(basket, params)
+
+        ttres_s = min(s.time_to_resolution_s for s in basket.outcomes.values())
+        quote_result = self._categorical_skew_engine.compute(
+            fv_result,
+            inventory_q={oid: self._inventory_mgr.get_net_qty(oid) for oid in basket.outcomes},
+            covariance_estimator=cov_est,
+            params=params,
+            ttres_s=ttres_s,
+        )
+
+        logger.debug(
+            "categorical_quote_computed",
+            event_id=event_id,
+            p_fair={oid: round(p, 4) for oid, p in fv_result.p_fair.items()},
+            should_quote=quote_result.should_quote,
+            sum_p_bid=round(basket.sum_p_bid, 4),
+            sum_p_ask=round(basket.sum_p_ask, 4),
+        )
+
+        if self._kill_event.is_set():
+            return
+
+        for oid, outcome_state in basket.outcomes.items():
+            outcome_mconf = self._cfg.markets.get(oid)
+            if outcome_mconf is None:
+                continue
+            fv = self._to_fair_value_result(oid, fv_result, quote_result, ttres_s)
+            await self._place_quotes_and_hedge(oid, outcome_mconf, outcome_state, fv)
+
+    @staticmethod
+    def _to_fair_value_result(outcome_id, fv_result, quote_result, ttres_s) -> FairValueResult:
+        """Adapts one outcome's slice of the categorical output into the
+        shape update_quotes() already knows how to consume, so
+        order_manager.py / kalshi_order_manager.py don't need to change
+        at all, they only ever read should_quote/bid_quote/ask_quote/
+        half_spread off this."""
+        return FairValueResult(
+            market_id=outcome_id,
+            ts=time.monotonic(),
+            p_fair=fv_result.p_fair[outcome_id],
+            p_reservation=quote_result.p_reservation[outcome_id],
+            bid_quote=quote_result.bid_quote[outcome_id],
+            ask_quote=quote_result.ask_quote[outcome_id],
+            half_spread=quote_result.half_spread[outcome_id],
+            p_base=fv_result.p_base[outcome_id],
+            flow_adjustment=fv_result.flow_adjustment[outcome_id],
+            inventory_skew=quote_result.inventory_skew[outcome_id],
+            binary_vol=quote_result.marginal_variance[outcome_id],
+            ttres_years=ttres_s / FairValueEngine.SECONDS_PER_YEAR,
+            should_quote=quote_result.should_quote,
+            is_stale=fv_result.is_stale,
+        )
+
+    async def _place_quotes_and_hedge(self, mid_id: str, mconf, state: MarketState, fv: FairValueResult) -> None:
+        """Size, quote and (if configured) hedge one market. Shared by the
+        binary and categorical paths, fv only ever needs to look like a
+        FairValueResult, see _to_fair_value_result for the categorical side."""
+        if not self._kill_event.is_set():
+            order_size_usd = compute_order_size_usd(
+                edge_bps=fv.half_spread * 10_000,
+                sigma=state.realized_vol_1m,
+                free_collateral_usd=self._inventory_mgr.get_free_collateral(mconf.venue.value),
+                risk_profile=mconf.risk,
+                correlated_exposure_usd=self._correlated_exposure_usd(mid_id, mconf.underlying_symbol),
+            )
+            if mconf.venue == Venue.POLYMARKET:
+                resolved = self._resolved_poly.get(mid_id)
+                if resolved is None:
+                    return  # never resolved at startup, can't quote safely
+                await self._order_manager.update_quotes(
+                    state=state,
+                    fv=fv,
+                    yes_token_id=resolved.yes_token_id,
                     inventory_q=self._inventory_mgr.get_net_qty(mid_id),
-                    p_mid=state.p_mid,
-                    S_perp=S_perp,
-                    K_strike=K_strike,
-                    sigma_perp=sigma_perp,
-                    T_res_s=state.time_to_resolution_s,
-                    perp_symbol=coin,
+                    order_size_usd=order_size_usd,
+                    neg_risk=resolved.neg_risk,
+                    tick_size=resolved.tick_size,
                 )
-                if instr:
-                    await self._hedge_engine.execute_hedge(
-                        self._http_session, instr, S_perp, sigma_perp
-                    )
+            elif self._kalshi_order_manager:
+                await self._kalshi_order_manager.update_quotes(
+                    state=state,
+                    fv=fv,
+                    ticker=mconf.condition_id,
+                    inventory_q=self._inventory_mgr.get_net_qty(mid_id),
+                    order_size_usd=order_size_usd,
+                )
+
+        # Trigger hedge if needed
+        if self._hedge_engine and mconf.hedge.enabled and mconf.underlying_symbol:
+            coin = mconf.underlying_symbol
+            S_perp = self._hl_price_feed.get_mid(coin) if self._hl_price_feed else None
+            sigma_perp = self._hl_price_feed.get_realized_vol(coin) if self._hl_price_feed else None
+            K_strike = mconf.underlying_strike
+
+            if S_perp is None or sigma_perp is None or K_strike is None:
+                # missing live price, not enough vol history yet, or no
+                # strike configured for this market, skip rather than
+                # hedge off a guess
+                logger.debug(
+                    "hedge_skipped_missing_data",
+                    market_id=mid_id,
+                    has_price=S_perp is not None,
+                    has_vol=sigma_perp is not None,
+                    has_strike=K_strike is not None,
+                )
+                return
+
+            instr = await self._hedge_engine.compute_and_hedge(
+                market_id=mid_id,
+                inventory_q=self._inventory_mgr.get_net_qty(mid_id),
+                p_mid=state.p_mid,
+                S_perp=S_perp,
+                K_strike=K_strike,
+                sigma_perp=sigma_perp,
+                T_res_s=state.time_to_resolution_s,
+                perp_symbol=coin,
+            )
+            if instr:
+                await self._hedge_engine.execute_hedge(
+                    self._http_session, instr, S_perp, sigma_perp
+                )
 
     # Calibration loop
     async def _calibration_loop(self) -> None:
