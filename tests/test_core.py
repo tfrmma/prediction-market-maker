@@ -1,6 +1,7 @@
 """Unit tests for the pricing and book components."""
 import math
 import time
+from typing import Dict
 
 import numpy as np
 import pytest
@@ -9,7 +10,12 @@ from src.data.unified_book import L2Book, UnifiedBook, BookSource
 from src.data.polymarket_feed import PolyBookSnapshot, PriceLevel, PolyTrade
 from src.pricing.fair_value import FairValueEngine, ASBinaryParams
 from src.execution.eip712_signer import EIP712Signer, OrderParams, OrderSide
-from src.data.categorical_book import CategoricalBookAggregator
+from src.data.categorical_book import CategoricalBookAggregator, CategoricalMarketState
+from src.pricing.covariance import (
+    CategoricalCovarianceEstimator,
+    multinomial_structural_covariance,
+    structural_probability_covariance,
+)
 from config.settings import Settings, MarketConfig, EventGroupConfig, Venue
 
 
@@ -860,3 +866,112 @@ class TestCategoricalBookAggregator:
     def test_constructor_rejects_single_outcome(self):
         with pytest.raises(ValueError):
             CategoricalBookAggregator("EVT", ["A"])
+
+
+# CategoricalCovarianceEstimator
+class TestCategoricalCovarianceEstimator:
+
+    def _basket(self, p_mids: Dict[str, float], ts):
+        """Fabricate a CategoricalMarketState with just enough on each
+        outcome's MarketState for p_mid to matter, we don't touch bid/ask
+        here so keep spread sane to not trip is_valid() elsewhere."""
+        from src.data.unified_book import MarketState
+        outcomes = {}
+        for oid, p in p_mids.items():
+            outcomes[oid] = MarketState(
+                market_id=oid, source=BookSource.POLYMARKET, ts=ts,
+                p_mid=p, p_bid=p - 0.01, p_ask=p + 0.01, spread=0.02,
+            )
+        sum_mid = sum(p_mids.values())
+        return CategoricalMarketState(
+            event_id="EVT", ts=ts, outcomes=outcomes,
+            sum_p_bid=sum_mid - 0.01 * len(p_mids),
+            sum_p_ask=sum_mid + 0.01 * len(p_mids),
+            sum_p_mid=sum_mid,
+        )
+
+    def test_constructor_rejects_single_outcome(self):
+        with pytest.raises(ValueError):
+            CategoricalCovarianceEstimator("EVT", ["A"])
+
+    def test_reference_id_is_last_outcome_by_convention(self):
+        est = CategoricalCovarianceEstimator("EVT", ["A", "B", "C"])
+        assert est.reference_id == "C"
+
+    def test_structural_covariance_symmetric_and_psd(self):
+        p = np.array([0.5, 0.3, 0.2])
+        sigma = multinomial_structural_covariance(p)
+        assert np.allclose(sigma, sigma.T)
+        eigvals = np.linalg.eigvalsh(sigma)
+        assert (eigvals >= -1e-9).all()
+
+    def test_structural_alr_covariance_shape_and_psd(self):
+        p_mid = {"A": 0.5, "B": 0.3, "C": 0.2}
+        sigma = structural_probability_covariance(p_mid, ["A", "B", "C"], reference_id="C")
+        assert sigma.shape == (2, 2)
+        assert np.allclose(sigma, sigma.T, atol=1e-9)
+        eigvals = np.linalg.eigvalsh(sigma)
+        assert (eigvals >= -1e-9).all()
+
+    def test_structural_variance_higher_for_a_close_race(self):
+        """Mirrors sigma_sq = p(1-p) peaking at p=0.5 in the binary case:
+        a close 3-way race should carry more structural variance than a
+        near-certain outcome. Has to hold in probability space, this is
+        exactly the property that broke when I first tried computing it
+        directly in ALR space, see the module docstring."""
+        close = structural_probability_covariance({"A": 0.34, "B": 0.33, "C": 0.33}, ["A", "B", "C"], "C")
+        lopsided = structural_probability_covariance({"A": 0.97, "B": 0.02, "C": 0.01}, ["A", "B", "C"], "C")
+        assert np.trace(close) > np.trace(lopsided)
+
+    def test_covariance_falls_back_to_structural_when_cold(self):
+        est = CategoricalCovarianceEstimator("EVT", ["A", "B", "C"])
+        p_mid = {"A": 0.5, "B": 0.3, "C": 0.2}
+        sigma = est.covariance(p_mid)
+        expected = structural_probability_covariance(p_mid, ["A", "B", "C"], "C")
+        assert np.allclose(sigma, expected)
+        assert est.alr_covariance() is None
+
+    def test_ewma_none_before_min_obs(self):
+        est = CategoricalCovarianceEstimator("EVT", ["A", "B"], correlation_window_s=60.0)
+        for i in range(est.MIN_OBS_FOR_EWMA - 1):
+            est.observe(self._basket({"A": 0.5, "B": 0.5}, ts=float(i)))
+        assert est.alr_covariance() is None
+
+    def test_ewma_available_after_min_obs(self):
+        est = CategoricalCovarianceEstimator("EVT", ["A", "B", "C"], correlation_window_s=60.0)
+        for i in range(est.MIN_OBS_FOR_EWMA + 5):
+            est.observe(self._basket({"A": 0.4, "B": 0.35, "C": 0.25}, ts=float(i)))
+        sigma = est.alr_covariance()
+        assert sigma is not None
+        assert sigma.shape == (2, 2)
+
+    def test_ewma_captures_injected_positive_correlation(self):
+        """Feed A and B moving together (both up, both down) beyond
+        anything the mutual-exclusivity structure alone would produce,
+        the off-diagonal of the ALR-space EWMA should come out positive
+        (correlation sign survives the ALR transform even though raw
+        magnitude doesn't carry over to probability space)."""
+        est = CategoricalCovarianceEstimator("EVT", ["A", "B", "C"], correlation_window_s=30.0)
+        rng = np.random.default_rng(7)
+        base_a, base_b, base_c = 0.34, 0.33, 0.33
+        for i in range(200):
+            shock = rng.normal(0.0, 0.03)
+            p_a = float(np.clip(base_a + shock, 0.05, 0.6))
+            p_b = float(np.clip(base_b + shock, 0.05, 0.6))   # moves WITH A
+            p_c = max(1e-3, 1.0 - p_a - p_b)
+            est.observe(self._basket({"A": p_a, "B": p_b, "C": p_c}, ts=float(i)))
+
+        sigma = est.alr_covariance()
+        assert sigma is not None
+        # A is index 0, B is index 1 in ALR space (C is reference, excluded)
+        assert sigma[0, 1] > 0
+
+    def test_covariance_uses_ewma_once_warm(self):
+        est = CategoricalCovarianceEstimator("EVT", ["A", "B"], correlation_window_s=60.0)
+        for i in range(est.MIN_OBS_FOR_EWMA + 1):
+            est.observe(self._basket({"A": 0.4, "B": 0.6}, ts=float(i)))
+        sigma = est.covariance({"A": 0.4, "B": 0.6})
+        # once warm, covariance() should differ from the (now stale) cold prior
+        cold_prior = structural_probability_covariance({"A": 0.4, "B": 0.6}, ["A", "B"], "B")
+        assert sigma.shape == cold_prior.shape
+        assert est.alr_covariance() is not None
