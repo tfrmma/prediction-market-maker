@@ -1,23 +1,7 @@
 """
-Aggregates N per-outcome MarketState snapshots (one per leg of an
-EventGroupConfig) into a single consistent basket view.
-
-Each outcome already comes out of UnifiedBook as an ordinary binary
-MarketState, p_mid there just means "probability this specific outcome
-happens" instead of "probability YES". The only new thing here is
-combining N of those and computing the same style of arb_gap signal
-unified_book.py already computes for YES/NO, just across outcomes
-instead of across the two legs of one market:
-
-  sum(bid_i) > 1  -> mint one of each outcome for $1, dump into every
-                      bid, guaranteed profit (needs a CTF-style split
-                      mechanism at the venue, true for Polymarket
-                      neg-risk markets).
-  sum(ask_i) < 1  -> buy one of each outcome at the ask, redeem
-                      whichever wins for $1, guaranteed profit.
-
-Not wired into BookRegistry yet. That happens once the strategy loop
-knows how to consume a basket instead of a single market at a time.
+Combines N per-outcome MarketState snapshots into one basket, and
+flags the sum(bid)>1 / sum(ask)<1 arb the per-market arb_gap can't see
+across outcomes. Not wired into BookRegistry yet.
 """
 from __future__ import annotations
 
@@ -40,8 +24,8 @@ class CategoricalMarketState:
 
     outcomes: Dict[str, MarketState]   # market_id -> latest state, one per outcome
 
-    sum_p_bid: float    # see module docstring for what each of these means
-    sum_p_ask: float
+    sum_p_bid: float    # bids sum > 1: mint 1 of each outcome for $1, dump on the bids
+    sum_p_ask: float    # asks sum < 1: buy 1 of each outcome, redeem the winner for $1
     sum_p_mid: float     # informational only, mid isn't tradable
 
     @property
@@ -53,14 +37,9 @@ class CategoricalMarketState:
         return 1.0 - self.sum_p_ask
 
     def is_valid(self, max_staleness_spread_s: float = 2.0) -> bool:
-        """
-        Sanity gate before this basket is safe to price off of.
-
-        Deliberately doesn't gate on the arb_gap properties above, a
-        few outcomes updating asynchronously means sum(bid_i) drifting
-        off 1 for a moment is routine, not bad data (that's a pricing
-        signal, see arb_gap_* above, not a validity check).
-        """
+        """Sanity gate before pricing off this basket. Doesn't gate on
+        arb_gap_*, async outcomes drifting off sum=1 for a moment is
+        routine, not bad data, that's a pricing signal not a validity check."""
         if not self.outcomes:
             return False
         for state in self.outcomes.values():
@@ -69,20 +48,15 @@ class CategoricalMarketState:
 
         timestamps = [s.ts for s in self.outcomes.values()]
         if max(timestamps) - min(timestamps) > max_staleness_spread_s:
-            # one leg is stale relative to the others, netting them right
-            # now would price fresh outcomes against a stale one
-            return False
+            return False   # one leg stale relative to its siblings
 
         return True
 
 
 class CategoricalBookAggregator:
-    """
-    One instance per event. Feed it MarketState updates for any of its
-    outcome markets as they arrive off the normal per-market feeds, get
-    a fresh CategoricalMarketState back once every outcome has reported
-    at least once.
-    """
+    """One instance per event. Feed it MarketState updates for its outcome
+    markets, get a CategoricalMarketState back once every outcome has
+    reported at least once."""
 
     ARB_LOG_THRESHOLD = 0.01   # log if either arb_gap exceeds this, purely diagnostic
 
@@ -99,14 +73,10 @@ class CategoricalBookAggregator:
         return all(oid in self._latest for oid in self._outcome_ids)
 
     def update(self, market_id: str, state: MarketState) -> Optional[CategoricalMarketState]:
-        """
-        Record a new snapshot for one outcome.
-
-        Returns the basket snapshot once every outcome has reported at
-        least once, None while still warming up. Note this can return a
-        basket whose is_valid() is False, that's on purpose, callers
-        decide what to do with a bad snapshot rather than never seeing it.
-        """
+        """Record a snapshot for one outcome, returns the basket once every
+        outcome has reported at least once, None while warming up. Can
+        return a basket whose is_valid() is False on purpose, callers
+        decide what to do with it."""
         if market_id not in self._outcome_ids:
             return None   # not one of ours, caller routed this wrong
 
