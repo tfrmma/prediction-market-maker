@@ -9,6 +9,7 @@ from src.data.unified_book import L2Book, UnifiedBook, BookSource
 from src.data.polymarket_feed import PolyBookSnapshot, PriceLevel, PolyTrade
 from src.pricing.fair_value import FairValueEngine, ASBinaryParams
 from src.execution.eip712_signer import EIP712Signer, OrderParams, OrderSide
+from src.data.categorical_book import CategoricalBookAggregator
 from config.settings import Settings, MarketConfig, EventGroupConfig, Venue
 
 
@@ -771,3 +772,91 @@ class TestEventGroupConfig:
         """Existing binary-only configs shouldn't need to know this exists."""
         s = Settings(markets=self._markets(1))
         assert s.event_groups == {}
+
+
+# CategoricalBookAggregator
+class TestCategoricalBookAggregator:
+
+    def _state(self, market_id, p_mid=0.33, spread=0.02, ts=None):
+        from src.data.unified_book import MarketState
+        return MarketState(
+            market_id=market_id,
+            source=BookSource.POLYMARKET,
+            ts=ts if ts is not None else time.monotonic(),
+            p_mid=p_mid,
+            p_bid=p_mid - spread / 2,
+            p_ask=p_mid + spread / 2,
+            spread=spread,
+        )
+
+    def test_none_until_every_outcome_has_reported(self):
+        agg = CategoricalBookAggregator("EVT", ["A", "B", "C"])
+        assert agg.update("A", self._state("A")) is None
+        assert agg.update("B", self._state("B")) is None
+        assert agg.ready is False
+
+    def test_basket_emitted_once_all_outcomes_reported(self):
+        agg = CategoricalBookAggregator("EVT", ["A", "B", "C"])
+        agg.update("A", self._state("A"))
+        agg.update("B", self._state("B"))
+        basket = agg.update("C", self._state("C"))
+        assert basket is not None
+        assert agg.ready is True
+        assert set(basket.outcomes.keys()) == {"A", "B", "C"}
+
+    def test_sums_computed_across_all_outcomes(self):
+        agg = CategoricalBookAggregator("EVT", ["A", "B", "C"])
+        agg.update("A", self._state("A", p_mid=0.50))
+        agg.update("B", self._state("B", p_mid=0.30))
+        basket = agg.update("C", self._state("C", p_mid=0.20))
+        assert basket.sum_p_mid == pytest.approx(1.0, abs=1e-9)
+        # p_bid = p_mid - 0.01, so sum_p_bid should be sum_p_mid - 3*0.01
+        assert basket.sum_p_bid == pytest.approx(0.97, abs=1e-9)
+        assert basket.sum_p_ask == pytest.approx(1.03, abs=1e-9)
+
+    def test_mint_and_dump_arb_gap_positive_when_bids_overpriced(self):
+        # bids alone sum to 1.05, textbook mint-1-of-each-and-dump setup
+        agg = CategoricalBookAggregator("EVT", ["A", "B"])
+        agg.update("A", self._state("A", p_mid=0.56, spread=0.02))   # bid 0.55
+        basket = agg.update("B", self._state("B", p_mid=0.51, spread=0.02))  # bid 0.50
+        assert basket.arb_gap_mint_and_dump == pytest.approx(0.05, abs=1e-9)
+        assert basket.arb_gap_buy_basket < 0
+
+    def test_buy_basket_arb_gap_positive_when_asks_underpriced(self):
+        # asks alone sum to 0.95, buy one of each at the ask and redeem the winner
+        agg = CategoricalBookAggregator("EVT", ["A", "B"])
+        agg.update("A", self._state("A", p_mid=0.49, spread=0.02))   # ask 0.50
+        basket = agg.update("B", self._state("B", p_mid=0.44, spread=0.02))  # ask 0.45
+        assert basket.arb_gap_buy_basket == pytest.approx(0.05, abs=1e-9)
+        assert basket.arb_gap_mint_and_dump < 0
+
+    def test_ignores_updates_for_market_not_in_group(self):
+        agg = CategoricalBookAggregator("EVT", ["A", "B"])
+        assert agg.update("SOME-OTHER-MARKET", self._state("SOME-OTHER-MARKET")) is None
+        assert agg.ready is False
+
+    def test_is_valid_false_when_any_outcome_invalid(self):
+        agg = CategoricalBookAggregator("EVT", ["A", "B"])
+        agg.update("A", self._state("A", p_mid=0.5))
+        crossed = self._state("B", p_mid=0.5)
+        crossed.p_bid, crossed.p_ask = 0.6, 0.4   # crossed book, invalid
+        basket = agg.update("B", crossed)
+        assert basket.is_valid() is False
+
+    def test_is_valid_false_when_stale_relative_to_siblings(self):
+        agg = CategoricalBookAggregator("EVT", ["A", "B"])
+        now = time.monotonic()
+        agg.update("A", self._state("A", ts=now))
+        basket = agg.update("B", self._state("B", ts=now + 5.0))
+        assert basket.is_valid(max_staleness_spread_s=2.0) is False
+
+    def test_is_valid_true_for_a_healthy_basket(self):
+        agg = CategoricalBookAggregator("EVT", ["A", "B"])
+        now = time.monotonic()
+        agg.update("A", self._state("A", ts=now, p_mid=0.6))
+        basket = agg.update("B", self._state("B", ts=now + 0.05, p_mid=0.4))
+        assert basket.is_valid() is True
+
+    def test_constructor_rejects_single_outcome(self):
+        with pytest.raises(ValueError):
+            CategoricalBookAggregator("EVT", ["A"])
