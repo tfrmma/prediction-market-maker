@@ -20,6 +20,7 @@ from src.pricing.categorical_fair_value import (
     CategoricalFairValueEngine,
     CategoricalASParams,
 )
+from src.pricing.categorical_skew import CategoricalSkewEngine
 from config.settings import Settings, MarketConfig, EventGroupConfig, Venue
 
 
@@ -1078,3 +1079,99 @@ class TestCategoricalFairValueEngine:
         result = engine.compute(basket, CategoricalASParams())
         assert result.is_stale is True
         assert result.should_quote is False
+
+
+# CategoricalSkewEngine
+class TestCategoricalSkewEngine:
+
+    def _basket(self, p_mids: Dict[str, float], ttres_s=86400):
+        from src.data.unified_book import MarketState
+        outcomes = {}
+        for oid, p in p_mids.items():
+            outcomes[oid] = MarketState(
+                market_id=oid, source=BookSource.POLYMARKET, ts=time.monotonic(),
+                p_mid=p, p_bid=p - 0.01, p_ask=p + 0.01, spread=0.02,
+                resolution_ts=int(time.time() + ttres_s), time_to_resolution_s=float(ttres_s),
+                book_ts_ms=int(time.time() * 1000),
+            )
+        sum_mid = sum(p_mids.values())
+        return CategoricalMarketState(
+            event_id="EVT", ts=time.monotonic(), outcomes=outcomes,
+            sum_p_bid=sum_mid - 0.01 * len(p_mids), sum_p_ask=sum_mid + 0.01 * len(p_mids),
+            sum_p_mid=sum_mid,
+        )
+
+    def _compute(self, p_mids, inventory_q, params=None, ttres_s=86400):
+        fv_engine = CategoricalFairValueEngine()
+        skew_engine = CategoricalSkewEngine()
+        params = params or CategoricalASParams(alpha=0.0, beta=0.0)
+        basket = self._basket(p_mids, ttres_s=ttres_s)
+        fv_result = fv_engine.compute(basket, params)
+        cov_est = CategoricalCovarianceEstimator("EVT", list(p_mids.keys()))
+        quote = skew_engine.compute(fv_result, inventory_q, cov_est, params, ttres_s=ttres_s)
+        return fv_result, quote
+
+    def test_reservation_prices_sum_to_one(self):
+        _, quote = self._compute({"A": 0.5, "B": 0.3, "C": 0.2}, {"A": 40.0, "B": -10.0})
+        assert sum(quote.p_reservation.values()) == pytest.approx(1.0, abs=1e-6)
+
+    def test_inventory_skew_sums_to_zero(self):
+        _, quote = self._compute({"A": 0.5, "B": 0.3, "C": 0.2}, {"A": 40.0, "B": -10.0, "C": 5.0})
+        assert sum(quote.inventory_skew.values()) == pytest.approx(0.0, abs=1e-9)
+
+    def test_zero_inventory_gives_zero_skew(self):
+        _, quote = self._compute({"A": 0.5, "B": 0.3, "C": 0.2}, {})
+        for skew in quote.inventory_skew.values():
+            assert skew == pytest.approx(0.0, abs=1e-9)
+
+    def test_n2_matches_binary_engine_exactly(self):
+        """For N=2, Sigma_reduced collapses to p_A*(1-p_A), the plain
+        binary variance, and q_tilde = q_A - q_B. So the categorical
+        skew for A should exactly match fair_value.py's own binary
+        engine given inventory_q = q_A - q_B, not just approximately."""
+        p_mids = {"A": 0.62, "B": 0.38}
+        q_a, q_b = 30.0, -15.0
+        params = CategoricalASParams(alpha=0.0, beta=0.0, gamma=0.05, k=1.5)
+        _, quote = self._compute(p_mids, {"A": q_a, "B": q_b}, params=params, ttres_s=86400)
+
+        binary_engine = FairValueEngine()
+        binary_params = ASBinaryParams(gamma=params.gamma, k=params.k, alpha=0.0, beta=0.0)
+        state = self._basket(p_mids).outcomes["A"]
+        binary_result = binary_engine.compute(state, inventory_q=(q_a - q_b), params=binary_params)
+
+        assert quote.p_reservation["A"] == pytest.approx(binary_result.p_reservation, abs=1e-6)
+        assert quote.half_spread["A"] == pytest.approx(binary_result.half_spread, abs=1e-6)
+        assert quote.bid_quote["A"] == pytest.approx(binary_result.bid_quote, abs=1e-6)
+        assert quote.ask_quote["A"] == pytest.approx(binary_result.ask_quote, abs=1e-6)
+
+    def test_long_reference_skews_reference_price_down(self):
+        """Long the reference outcome (net positive q_tilde against every
+        sibling) should skew the reference's own reservation price down,
+        same intuition as the binary engine: long inventory -> skew down
+        to encourage selling."""
+        _, quote_flat = self._compute({"A": 1 / 3, "B": 1 / 3, "C": 1 / 3}, {})
+        _, quote_long_c = self._compute({"A": 1 / 3, "B": 1 / 3, "C": 1 / 3}, {"C": 100.0})
+        # C is the reference (last in outcome_ids order for this basket)
+        assert quote_long_c.p_reservation["C"] < quote_flat.p_reservation["C"]
+
+    def test_max_skew_clips_extreme_inventory(self):
+        params = CategoricalASParams(alpha=0.0, beta=0.0, max_skew=0.05)
+        _, quote = self._compute({"A": 0.5, "B": 0.3, "C": 0.2}, {"A": 1e6}, params=params)
+        for oid in ("A", "B"):   # non-reference outcomes, directly clipped
+            assert abs(quote.inventory_skew[oid]) <= 0.05 + 1e-9
+
+    def test_half_spread_within_guardrails(self):
+        params = CategoricalASParams(alpha=0.0, beta=0.0, min_half_spread=0.01, max_half_spread=0.03)
+        _, quote = self._compute({"A": 0.5, "B": 0.3, "C": 0.2}, {}, params=params)
+        for hs in quote.half_spread.values():
+            assert 0.01 - 1e-9 <= hs <= 0.03 + 1e-9
+
+    def test_quotes_never_crossed(self):
+        _, quote = self._compute({"A": 0.5, "B": 0.3, "C": 0.2}, {"A": 300.0, "B": -200.0})
+        for oid in quote.bid_quote:
+            assert quote.bid_quote[oid] < quote.ask_quote[oid]
+
+    def test_should_quote_passes_through_from_fair_value_result(self):
+        fv_result, quote = self._compute({"A": 0.5, "B": 0.5}, {}, ttres_s=60)
+        assert fv_result.should_quote is False
+        assert quote.should_quote is False
