@@ -1,44 +1,18 @@
 """
-Covariance estimator for the categorical inventory skew, feeds the Σ
-matrix into the Guéant-style multi-asset A-S reservation price:
+Sigma for the categorical A-S skew: r = p_fair - gamma*(Sigma@q)*(T-t).
+Needs probability units, same as p_fair/q, same as fair_value.py's
+scalar p*(1-p) for the binary case.
 
-    r = p_fair - gamma * (Sigma @ q) * (T-t)
+Structural prior (no history needed): multinomial payout covariance
+diag(p) - p*pᵀ with the reference outcome's row/column dropped, same
+trick as a baseline category in dummy-variable regression.
 
-q is signed inventory in contracts, p_fair is a probability, so Sigma
-needs to be in probability units for that formula to be dimensionally
-sane, same units fair_value.py's scalar p*(1-p) is already in for the
-binary case.
-
-Raw probabilities live on a simplex (sum to 1), so their raw N x N
-covariance matrix is singular, N-1 degrees of freedom for N numbers.
-Two ways we deal with that here, for two different purposes:
-
-  - Structural prior (probability units): for N mutually-exclusive
-    outcomes with true probabilities p, the terminal payout vector is
-    one-hot Multinomial(1, p), covariance diag(p) - p pᵀ. Dropping the
-    reference outcome's row/column from that (same trick as dropping a
-    baseline category in dummy-variable regression) gives a
-    non-singular (N-1)x(N-1) probability-unit matrix, exactly the
-    N-outcome generalization of p*(1-p). Needs zero history.
-
-  - Online EWMA (internally ALR space): tracking realized co-movement
-    of the raw probabilities directly runs into the same singularity,
-    plus the variance of p_i isn't stationary in p_i (a move near 0 or
-    1 behaves differently than one near 0.5). Additive log-ratio space,
-    y_i = ln(p_i / p_ref) for every non-reference outcome, is a
-    well-behaved bijection off the simplex onto unconstrained R^(N-1)
-    and is what we actually run the EWMA on. The catch: ALR variance
-    for an outcome scales like 1/p_i, so its magnitude is in log-ratio
-    units, not probability units, don't feed it into the skew formula
-    directly (tested that the hard way, see test_core.py). We convert
-    back to probability space via the local delta-method Jacobian at
-    the current prices before handing it to a caller.
-
-covariance() is the one thing external code should call, it's always
-probability-space regardless of whether it's serving the structural
-prior or the converted EWMA. alr_covariance() is exposed separately
-for diagnostics (correlation, being scale-invariant, is directly
-readable there without conversion).
+Online EWMA runs internally in additive log-ratio (ALR) space, raw
+probabilities are simplex-constrained so their covariance is singular.
+ALR variance scales like 1/p_i though, wrong units for the skew
+formula (caught this via a failing test, see test_core.py), so
+covariance() always converts back to probability space via the local
+delta-method Jacobian before returning.
 """
 from __future__ import annotations
 
@@ -63,12 +37,9 @@ def structural_probability_covariance(
     outcome_ids: List[str],
     reference_id: str,
 ) -> np.ndarray:
-    """
-    Probability-space structural prior for the non-reference outcomes,
-    the multinomial covariance with the reference row/column dropped.
-    Always available, no history required, this is what
-    CategoricalCovarianceEstimator.covariance() falls back to cold.
-    """
+    """Probability-space structural prior, multinomial covariance with the
+    reference row/column dropped. No history required, cold-start fallback
+    for CategoricalCovarianceEstimator.covariance()."""
     p = np.array([p_mid[oid] for oid in outcome_ids], dtype=float)
     p = np.clip(p, 1e-6, 1.0)
     p = p / p.sum()   # renormalize, should already be ~1 but don't trust upstream blindly
@@ -81,22 +52,16 @@ def structural_probability_covariance(
 
 
 class CategoricalCovarianceEstimator:
-    """
-    One instance per event. Feed it CategoricalMarketState snapshots as
-    they arrive, call covariance(current_p_mid) to get an (N-1)x(N-1)
-    probability-space matrix for the non-reference outcomes, EWMA-based
-    once warmed up, the structural prior otherwise.
+    """One instance per event. Feed it CategoricalMarketState snapshots,
+    call covariance(current_p_mid) for an (N-1)x(N-1) probability-space
+    matrix, EWMA once warmed up, structural prior otherwise. Reference
+    outcome is fixed at construction (last id in outcome_ids), switching
+    it mid-stream would break the running EWMA's coordinate system.
 
-    Reference outcome is fixed at construction (last id in outcome_ids)
-    and never changes, the running EWMA's internal ALR coordinate
-    system depends on it staying put.
-
-    TODO: if the reference outcome's own probability collapses toward
-    0 well into the estimator's life (leading candidate gets knocked
-    out by news, say), the ALR->probability conversion below gets
-    poorly conditioned right when you'd want it most. Haven't hit this
-    in practice yet, worth a CLR/ILR basis instead of a single fixed
-    reference if it turns out to actually happen.
+    TODO: if the reference outcome's own probability collapses toward 0
+    well into the estimator's life, the ALR->probability conversion gets
+    poorly conditioned. Haven't hit this in practice, worth a CLR/ILR
+    basis instead of a fixed reference if it does.
     """
 
     MIN_OBS_FOR_EWMA = 30
@@ -154,34 +119,24 @@ class CategoricalCovarianceEstimator:
         self._n_obs += 1
 
     def alr_covariance(self) -> Optional[np.ndarray]:
-        """
-        Diagnostic: the raw EWMA in its native log-ratio space, None
-        until warmed up. Correlation (scale-invariant) is directly
-        readable here, the covariance magnitude itself is in log-ratio
-        units, use covariance() for anything going into the skew formula.
-        """
+        """Diagnostic: raw EWMA in native log-ratio space, None until
+        warmed up. Use covariance() for anything feeding the skew formula."""
         if self._n_obs < self.MIN_OBS_FOR_EWMA:
             return None
         return self._cov
 
     def _alr_jacobian(self, current_p_mid: Dict[str, float]) -> np.ndarray:
-        """
-        Local Jacobian d(ALR)/d(p_free) at current_p_mid, diagonal
-        (1/p_i) plus a constant (1/p_ref) picked up from p_ref itself
-        depending on every free p_j through the simplex constraint.
-        """
+        """Local Jacobian d(ALR)/d(p_free) at current_p_mid: diagonal
+        1/p_i plus a constant 1/p_ref from the simplex constraint."""
         p_ref = max(current_p_mid[self._reference_id], 1e-6)
         p_free = np.array([max(current_p_mid[oid], 1e-6) for oid in self._non_reference_ids])
         n = len(p_free)
         return np.diag(1.0 / p_free) + (1.0 / p_ref) * np.ones((n, n))
 
     def covariance(self, current_p_mid: Dict[str, float]) -> np.ndarray:
-        """
-        Main entry point, always probability-space, safe to plug into
-        the A-S skew formula. EWMA once warmed up, converted from its
-        native ALR-space estimate via the local delta-method Jacobian
-        at current_p_mid, otherwise the structural prior.
-        """
+        """Probability-space, safe for the skew formula. EWMA once warmed
+        up (converted via the local Jacobian at current_p_mid), structural
+        prior otherwise."""
         if self._n_obs >= self.MIN_OBS_FOR_EWMA:
             jac = self._alr_jacobian(current_p_mid)
             jac_inv = np.linalg.inv(jac)
