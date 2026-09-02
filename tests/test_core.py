@@ -23,6 +23,11 @@ from src.pricing.categorical_fair_value import (
 from src.pricing.categorical_skew import CategoricalSkewEngine
 from src.inventory.manager import InventoryManager
 from config.settings import Settings, MarketConfig, EventGroupConfig, Venue, RiskProfile
+from tests.categorical_backtest_simulator import (
+    CategoricalSimConfig,
+    CategoricalBacktestRunner,
+    CategoricalMarketSimulator,
+)
 
 
 # L2Book
@@ -1307,3 +1312,100 @@ class TestInventoryManagerBasketNetting:
         # share, A has the largest raw position so it should carry the
         # largest share of the basket's netted worst-case exposure
         assert report.concentration["A"] > report.concentration["B"] > report.concentration["C"]
+
+
+# End-to-end categorical integration: all 7 pieces together, no mocks
+class TestCategoricalIntegration:
+    """Everything from commits 2-7 wired together against a simulated
+    4-candidate election, no mocking. Per-tick invariants (not PnL
+    magnitude, see categorical_backtest_simulator.py's module docstring
+    for why that number isn't meant to be realistic) are what actually
+    validate the system holds together."""
+
+    def test_invariants_hold_every_tick_across_a_run(self):
+        """Runs the real pipeline (aggregator -> covariance -> fair
+        value -> skew) tick by tick, checking p_fair sums to 1,
+        reservation prices sum to 1, and quotes never cross, every
+        single tick, not just at the end."""
+        cfg = CategoricalSimConfig(
+            outcome_ids=["A", "B", "C", "D"], resolution_s=21600.0, tick_s=30.0, random_seed=11,
+        )
+        params = CategoricalASParams(min_ttres_s=1800.0)
+        path = CategoricalMarketSimulator(cfg).generate_path()
+        from src.data.unified_book import MarketState
+
+        aggregator = CategoricalBookAggregator("EVT", cfg.outcome_ids)
+        cov_est = CategoricalCovarianceEstimator("EVT", cfg.outcome_ids, correlation_window_s=600.0)
+        fv_engine = CategoricalFairValueEngine()
+        skew_engine = CategoricalSkewEngine()
+
+        sim_start = time.time()
+        n_quoted_ticks = 0
+        n_steps = path.probs.shape[0] - 1
+
+        for t in range(n_steps):
+            ttres_s = max(0.0, cfg.resolution_s - t * cfg.tick_s)
+            basket = None
+            for i, oid in enumerate(cfg.outcome_ids):
+                p = float(path.probs[t, i])
+                state = MarketState(
+                    market_id=oid, source=BookSource.KALSHI, ts=float(t),
+                    p_mid=p, p_bid=p - 0.005, p_ask=p + 0.005, spread=0.01,
+                    resolution_ts=int(cfg.resolution_s), time_to_resolution_s=ttres_s,
+                    book_ts_ms=int((sim_start + t * cfg.tick_s) * 1000),
+                )
+                basket = aggregator.update(oid, state)
+
+            assert basket is not None   # all 4 outcomes reported every tick by construction
+            cov_est.observe(basket)
+
+            fv_result = fv_engine.compute(basket, params)
+            assert sum(fv_result.p_fair.values()) == pytest.approx(1.0, abs=1e-6), f"tick {t}"
+
+            if not fv_result.should_quote:
+                continue
+            n_quoted_ticks += 1
+
+            quote = skew_engine.compute(
+                fv_result, inventory_q={}, covariance_estimator=cov_est,
+                params=params, ttres_s=ttres_s,
+            )
+            assert sum(quote.p_reservation.values()) == pytest.approx(1.0, abs=1e-6), f"tick {t}"
+            assert sum(quote.inventory_skew.values()) == pytest.approx(0.0, abs=1e-6), f"tick {t}"
+            for oid in cfg.outcome_ids:
+                assert quote.bid_quote[oid] < quote.ask_quote[oid], f"tick {t} outcome {oid}"
+
+        assert n_quoted_ticks > 0   # sanity: the run actually exercised the quoting path
+
+    def test_backtest_runner_completes_and_settles_correctly(self):
+        """Full CategoricalBacktestRunner run, checks the mechanism works
+        (fills happen, resolution settles) not the PnL magnitude."""
+        cfg = CategoricalSimConfig(
+            outcome_ids=["A", "B", "C", "D"], resolution_s=86400.0, tick_s=60.0, random_seed=7,
+        )
+        runner = CategoricalBacktestRunner(cfg)
+        result = runner.run(CategoricalASParams(min_ttres_s=3600.0))
+
+        assert result.winner in cfg.outcome_ids
+        assert result.n_fills > 0
+        assert sum(result.per_outcome_fills.values()) == result.n_fills
+        assert math.isfinite(result.total_pnl)
+        assert math.isfinite(result.sharpe)
+        assert result.max_drawdown <= 0.0   # a drawdown is a distance below the running peak
+        # softmax layer should keep the basket close to consistent throughout,
+        # not a tight bound, individual outcome books are noisy by construction
+        assert result.max_avg_arb_gap < 0.5
+
+    def test_uneven_starting_probabilities_still_settle_correctly(self):
+        """Non-uniform p0 (a real election isn't a coinflip between N
+        candidates), softmax path generation should still keep every row
+        summing to 1 and resolve to exactly one winner."""
+        cfg = CategoricalSimConfig(
+            outcome_ids=["FRONTRUNNER", "B", "C", "D"],
+            p0={"FRONTRUNNER": 0.55, "B": 0.25, "C": 0.12, "D": 0.08},
+            resolution_s=43200.0, tick_s=30.0, random_seed=3,
+        )
+        path = CategoricalMarketSimulator(cfg).generate_path()
+        row_sums = path.probs.sum(axis=1)
+        assert np.allclose(row_sums, 1.0, atol=1e-9)
+        assert path.winner in cfg.outcome_ids
