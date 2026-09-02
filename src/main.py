@@ -226,6 +226,7 @@ class Orchestrator:
             self._categorical_params[event_id] = CategoricalASParams()
             for mid in group.outcome_ids:
                 self._market_to_event[mid] = event_id
+                self._inventory_mgr.register_market(mid, group.venue.value, event_id=event_id)
 
         # Risk engine
         self._risk_engine = RiskEngine(
