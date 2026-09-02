@@ -21,7 +21,8 @@ from src.pricing.categorical_fair_value import (
     CategoricalASParams,
 )
 from src.pricing.categorical_skew import CategoricalSkewEngine
-from config.settings import Settings, MarketConfig, EventGroupConfig, Venue
+from src.inventory.manager import InventoryManager
+from config.settings import Settings, MarketConfig, EventGroupConfig, Venue, RiskProfile
 
 
 # L2Book
@@ -1220,3 +1221,89 @@ class TestOrchestratorCategoricalAdapter:
         assert fv_b.market_id == "B"
         assert fv_b.bid_quote == 0.395
         assert fv_b.ask_quote == 0.445
+
+
+# InventoryManager basket netting (_effective_exposure)
+class TestInventoryManagerBasketNetting:
+    """_effective_exposure replaces naive per-market gross_exposure with
+    that market's share of the event's real worst-case loss for markets
+    in an event group. Validated these numbers by hand against
+    on_resolution()'s own PnL formula before writing assertions, see
+    the module docstring in inventory/manager.py."""
+
+    def _make(self, qty: Dict[str, float], mids=(0.5, 0.3, 0.2), event_id="EVT"):
+        inv = InventoryManager(RiskProfile())
+        for m in "ABC":
+            inv.register_market(m, "kalshi", event_id=event_id)
+        for m, p in zip("ABC", mids):
+            inv.update_mid(m, p)
+        for m, p in zip("ABC", mids):
+            q = qty.get(m, 0.0)
+            pos = inv._positions[m]
+            pos.net_qty = q
+            if q >= 0:
+                pos.long_qty, pos.avg_entry_long = q, p
+            else:
+                pos.short_qty, pos.avg_entry_short = -q, p
+        return inv
+
+    def test_uniform_basket_has_zero_effective_exposure(self):
+        """Long the same size in every outcome at current mark is the
+        riskless mint-the-basket case, real P&L is 0 in every resolution
+        scenario, checked by hand."""
+        inv = self._make({"A": 100, "B": 100, "C": 100})
+        for m in "ABC":
+            assert inv._effective_exposure(m) == pytest.approx(0.0, abs=1e-6)
+
+    def test_flat_sibling_gets_zero_not_phantom_exposure(self):
+        """A market with net_qty=0 must never show exposure just because
+        a sibling in the same event is imbalanced, first version of this
+        got that wrong (mean-deviation netting), fixed by attributing
+        the event's worst-case loss proportionally to gross_exposure."""
+        inv = self._make({"A": 100})
+        assert inv._effective_exposure("B") == pytest.approx(0.0, abs=1e-9)
+        assert inv._effective_exposure("C") == pytest.approx(0.0, abs=1e-9)
+        assert inv._effective_exposure("A") == pytest.approx(50.0, abs=1e-6)   # matches naive here, only leg with risk
+
+    def test_long_short_is_not_treated_as_a_hedge(self):
+        """Long A / short B in a 3-way event isn't a hedge, worst case
+        (B wins) is -120, worse than either leg alone, real risk, should
+        NOT net down below the naive sum."""
+        inv = self._make({"A": 100, "B": -100})
+        total = sum(inv._effective_exposure(m) for m in "ABC")
+        naive_total = sum(inv._positions[m].gross_exposure for m in "ABC")
+        assert total == pytest.approx(naive_total, abs=1e-6)
+        assert total == pytest.approx(120.0, abs=1e-6)
+
+    def test_diversified_basket_nets_down_to_real_worst_case(self):
+        """Long across all three outcomes, unevenly, genuinely reduces
+        worst-case loss vs. the naive sum (worst case is C winning, -36,
+        vs. naive sum of 76)."""
+        inv = self._make({"A": 100, "B": 60, "C": 40})
+        total = sum(inv._effective_exposure(m) for m in "ABC")
+        naive_total = sum(inv._positions[m].gross_exposure for m in "ABC")
+        assert total < naive_total
+        assert total == pytest.approx(36.0, abs=1e-6)
+
+    def test_standalone_market_unaffected(self):
+        """A market not in any event group behaves exactly as before,
+        no event_id ever passed to register_market for it."""
+        inv = InventoryManager(RiskProfile())
+        inv.register_market("SOLO", "polymarket")
+        inv.update_mid("SOLO", 0.4)
+        inv._positions["SOLO"].net_qty = 50
+        inv._positions["SOLO"].long_qty = 50
+        inv._positions["SOLO"].avg_entry_long = 0.4
+        assert inv._effective_exposure("SOLO") == pytest.approx(inv._positions["SOLO"].gross_exposure)
+
+    def test_concentration_report_uses_netted_exposure(self):
+        """End to end: generate_report()'s concentration dict for a
+        diversified basket should reflect the netted totals, not the
+        naive per-market gross sum."""
+        inv = self._make({"A": 100, "B": 60, "C": 40})
+        report = inv.generate_report()
+        assert sum(report.concentration.values()) == pytest.approx(1.0, abs=1e-6)
+        # attribution is proportional to each market's own gross_exposure
+        # share, A has the largest raw position so it should carry the
+        # largest share of the basket's netted worst-case exposure
+        assert report.concentration["A"] > report.concentration["B"] > report.concentration["C"]
