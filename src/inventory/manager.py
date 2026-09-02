@@ -194,11 +194,22 @@ class InventoryManager:
         self._fill_proc = FillProcessor()
         self._log = logger.bind(component="inventory")
 
+        # Categorical event membership, for concentration netting (see
+        # _effective_exposure). Markets not in any event just fall back
+        # to plain gross_exposure, unchanged from before.
+        self._event_of_market: Dict[str, str] = {}
+        self._markets_of_event: Dict[str, List[str]] = {}
+
     # Setup
-    def register_market(self, market_id: str, venue: str) -> None:
+    def register_market(self, market_id: str, venue: str, event_id: Optional[str] = None) -> None:
         if market_id not in self._positions:
             self._positions[market_id] = Position(market_id=market_id, venue=venue)
             self._realized_pnl[market_id] = 0.0
+        if event_id is not None:
+            self._event_of_market[market_id] = event_id
+            self._markets_of_event.setdefault(event_id, [])
+            if market_id not in self._markets_of_event[event_id]:
+                self._markets_of_event[event_id].append(market_id)
 
     def register_account(
         self,
@@ -364,10 +375,11 @@ class InventoryManager:
         total_gross       = sum(p.gross_exposure for p in self._positions.values())
         total_unrealized  = sum(p.unrealized_pnl for p in self._positions.values())
 
+        total_effective = sum(self._effective_exposure(mid) for mid in self._positions)
         concentration = {}
-        if total_gross > 0:
-            for mid, pos in self._positions.items():
-                concentration[mid] = pos.gross_exposure / total_gross
+        if total_effective > 0:
+            for mid in self._positions:
+                concentration[mid] = self._effective_exposure(mid) / total_effective
 
         signals = self._generate_rebalance_signals(concentration)
 
@@ -388,14 +400,69 @@ class InventoryManager:
             self._positions[market_id] = Position(market_id=market_id, venue="unknown")
         return self._positions[market_id]
 
+    def _event_worst_case_loss(self, event_id: str) -> float:
+        """Worst-case $ loss across the N ways this event can resolve,
+        same PnL math on_resolution() already uses and trusts, just
+        evaluated for every possible winner instead of the one that
+        actually happens. Always >= 0."""
+        members = self._markets_of_event.get(event_id, [])
+        worst = 0.0
+        for winner in members:
+            pnl = 0.0
+            for m in members:
+                pos = self._positions.get(m)
+                if pos is None:
+                    continue
+                res = 1.0 if m == winner else 0.0
+                pnl += (res - pos.avg_entry_long) * pos.long_qty + (pos.avg_entry_short - res) * pos.short_qty
+            worst = min(worst, pnl)
+        return -worst
+
+    def _effective_exposure(self, market_id: str) -> float:
+        """Same $ figure as Position.gross_exposure for a standalone
+        market. For markets in an event group, replaces the naive
+        per-market figure with that market's share of the event's true
+        worst-case loss (_event_worst_case_loss), split proportionally
+        by each member's own gross_exposure.
+
+        Tried netting q against the basket's mean position first, that
+        correctly zeroes out a uniform long-every-outcome position (the
+        genuinely riskless "mint the basket" case) but assigned phantom
+        exposure to flat (net_qty=0) siblings just for existing next to
+        an imbalanced position, and didn't reduce the long-A/short-B
+        case at all. Checked the real worst-case P&L by hand for that
+        case: long A + short B in a 3-way event isn't a hedge, it's a
+        leveraged directional bet (worst case is worse than either leg
+        alone), so it shouldn't net down, only the genuinely-diversified
+        case should. This version gets both right and a flat position
+        always gets exactly 0.
+        """
+        pos = self._positions.get(market_id)
+        if pos is None:
+            return 0.0
+
+        event_id = self._event_of_market.get(market_id)
+        if event_id is None:
+            return pos.gross_exposure
+
+        members = self._markets_of_event.get(event_id, [])
+        naive_total = sum(self._positions[m].gross_exposure for m in members if m in self._positions)
+        if naive_total <= 0:
+            return 0.0
+
+        worst_case = self._event_worst_case_loss(event_id)
+        return worst_case * (pos.gross_exposure / naive_total)
+
     def _check_concentration(self) -> None:
-        """Emit warnings if any single market exceeds concentration limits."""
-        total_gross = sum(p.gross_exposure for p in self._positions.values())
-        if total_gross <= 0:
+        """Emit warnings if any single market exceeds concentration limits.
+        Uses _effective_exposure (netted for event members), not raw
+        gross_exposure, see that method's docstring."""
+        total = sum(self._effective_exposure(mid) for mid in self._positions)
+        if total <= 0:
             return
 
-        for mid, pos in self._positions.items():
-            conc = pos.gross_exposure / total_gross
+        for mid in self._positions:
+            conc = self._effective_exposure(mid) / total
             if conc > self.CONCENTRATION_LIMIT:
                 self._log.warning(
                     "concentration_limit_breach",
