@@ -15,7 +15,11 @@ from typing import Dict, List, Optional
 
 import aiohttp
 import structlog
-import uvloop
+
+try:
+    import uvloop   # Linux/macOS only, no Windows support upstream
+except ImportError:
+    uvloop = None
 
 from config.settings import Settings, get_settings, Venue
 from src.data.polymarket_feed import (
@@ -792,5 +796,8 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    uvloop.install()
+    if uvloop is not None:
+        uvloop.install()
+    else:
+        logger.warning("uvloop_unavailable", detail="falling back to the default asyncio event loop")
     asyncio.run(main())
