@@ -9,30 +9,24 @@ description = "Algorithmic market making engine for Polymarket CLOB and Kalshi"
 requires-python = ">=3.11"
 
 dependencies = [
-    # Async runtime
-    "uvloop>=0.19",
+    "uvloop>=0.19; sys_platform != 'win32'",
     "aiohttp>=3.9",
     "websockets>=12.0",
 
-    # Quantitative
     "numpy>=1.26",
     "scipy>=1.12",
 
-    # Config / validation
     "pydantic>=2.6",
     "pydantic-settings>=2.2",
 
-    # Ethereum signing
     "eth-account>=0.10",
     "eth-keys>=0.5",
     "eth-utils>=3.0",       # keccak for Hyperliquid's phantom-agent hash
     "cryptography>=42.0",   # RSA for Kalshi
     "msgpack>=1.0",         # Hyperliquid L1 action packing
 
-    # Logging
     "structlog>=24.1",
 
-    # CLI
     "click>=8.1",
 ]
 
