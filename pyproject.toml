@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "prediction-mm"
@@ -58,6 +58,9 @@ testpaths = ["tests"]
 log_cli = true
 log_cli_level = "WARNING"
 
+[tool.setuptools.packages.find]
+include = ["config*", "src*"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
@@ -66,3 +69,4 @@ target-version = "py311"
 python_version = "3.11"
 strict = true
 ignore_missing_imports = true
+plugins = ["pydantic.mypy"]
