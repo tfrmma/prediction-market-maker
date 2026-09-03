@@ -16,6 +16,7 @@ Kalshi only ever gives us bids on both legs (see kalshi_feed.py), so the
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from collections import deque
 from dataclasses import dataclass, field
