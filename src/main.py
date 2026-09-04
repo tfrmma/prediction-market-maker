@@ -8,6 +8,7 @@ it before acting.
 from __future__ import annotations
 
 import asyncio
+import math
 import signal
 import sys
 import time
@@ -33,7 +34,9 @@ from src.pricing.fair_value import FairValueEngine, ASBinaryParams, ParameterCal
 from src.pricing.sizing import compute_order_size_usd
 from src.data.categorical_book import CategoricalBookAggregator
 from src.pricing.covariance import CategoricalCovarianceEstimator
-from src.pricing.categorical_fair_value import CategoricalFairValueEngine, CategoricalASParams
+from src.pricing.categorical_fair_value import (
+    CategoricalFairValueEngine, CategoricalASParams, CategoricalParameterCalibrator,
+)
 from src.pricing.categorical_skew import CategoricalSkewEngine
 from src.execution.eip712_signer import EIP712Signer
 from src.execution.order_manager import OrderManager
@@ -79,6 +82,8 @@ class Orchestrator:
         self._categorical_aggregators: Dict[str, CategoricalBookAggregator] = {}
         self._categorical_cov: Dict[str, CategoricalCovarianceEstimator] = {}
         self._categorical_params: Dict[str, CategoricalASParams] = {}
+        self._categorical_calibrators: Dict[str, CategoricalParameterCalibrator] = {}
+        self._categorical_last_p: Dict[str, float] = {}   # per outcome market_id
 
         # Core components (initialized in setup())
         self._book_registry: BookRegistry = None
@@ -228,6 +233,9 @@ class Orchestrator:
                 event_id, group.outcome_ids, correlation_window_s=group.correlation_window_s,
             )
             self._categorical_params[event_id] = CategoricalASParams()
+            self._categorical_calibrators[event_id] = CategoricalParameterCalibrator(
+                event_id, self._categorical_params[event_id],
+            )
             for mid in group.outcome_ids:
                 self._market_to_event[mid] = event_id
                 self._inventory_mgr.register_market(mid, group.venue.value, event_id=event_id)
@@ -539,6 +547,18 @@ class Orchestrator:
         cov_est = self._categorical_cov[event_id]
         cov_est.observe(basket)
 
+        # Flow calibration: pool (cvd, ofi) -> delta_ln(p) observations
+        # across every outcome into this event's shared calibrator, same
+        # pattern as the binary path's self._calibrators[mid_id].observe(...)
+        calibrator = self._categorical_calibrators[event_id]
+        for oid, outcome_state in basket.outcomes.items():
+            prev_p = self._categorical_last_p.get(oid, outcome_state.p_mid)
+            delta_ln_p = math.log(max(outcome_state.p_mid, 1e-6)) - math.log(max(prev_p, 1e-6))
+            self._categorical_last_p[oid] = outcome_state.p_mid
+            calibrator.observe_flow(
+                cvd=outcome_state.cvd, ofi_norm=outcome_state.imbalance, delta_ln_p_next=delta_ln_p,
+            )
+
         params = self._categorical_params[event_id]
         fv_result = self._categorical_fv_engine.compute(basket, params)
 
@@ -676,6 +696,15 @@ class Orchestrator:
                     alpha=round(updated.alpha, 6),
                     beta=round(updated.beta, 6),
                     gamma=round(updated.gamma, 5),
+                )
+            for event_id, cat_cal in self._categorical_calibrators.items():
+                updated = cat_cal.recalibrate_flow()
+                self._categorical_params[event_id] = updated
+                logger.info(
+                    "categorical_params_updated",
+                    event_id=event_id,
+                    alpha=round(updated.alpha, 6),
+                    beta=round(updated.beta, 6),
                 )
 
     # Kill monitor
