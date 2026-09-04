@@ -19,6 +19,7 @@ from src.pricing.covariance import (
 from src.pricing.categorical_fair_value import (
     CategoricalFairValueEngine,
     CategoricalASParams,
+    CategoricalParameterCalibrator,
 )
 from src.pricing.categorical_skew import CategoricalSkewEngine
 from src.inventory.manager import InventoryManager
@@ -1085,6 +1086,121 @@ class TestCategoricalFairValueEngine:
         result = engine.compute(basket, CategoricalASParams())
         assert result.is_stale is True
         assert result.should_quote is False
+
+
+# CategoricalParameterCalibrator
+class TestCategoricalParameterCalibrator:
+
+    def test_flow_returns_unchanged_below_min_obs(self):
+        cal = CategoricalParameterCalibrator("EVT", CategoricalASParams(alpha=0.001, beta=0.002))
+        for _ in range(cal.MIN_OBS_FOR_OLS - 1):
+            cal.observe_flow(cvd=10.0, ofi_norm=0.1, delta_ln_p_next=0.001)
+        params = cal.recalibrate_flow()
+        assert params.alpha == 0.001
+        assert params.beta == 0.002
+
+    def test_flow_ols_converges_to_true_coefficients(self):
+        """delta_ln_p = true_alpha*cvd + true_beta*ofi + noise, repeated
+        recalibrate_flow() cycles (each blends 70% old / 30% new, same
+        regularization as fair_value.py's binary calibrator) should walk
+        alpha/beta toward the true values, not just take one 30% step."""
+        rng = np.random.default_rng(0)
+        true_alpha, true_beta = 0.003, 0.0015
+        cal = CategoricalParameterCalibrator("EVT", CategoricalASParams(alpha=0.0, beta=0.0))
+
+        for _ in range(8):
+            for _ in range(400):
+                cvd = rng.normal(0, 50)
+                ofi = rng.normal(0, 0.3)
+                noise = rng.normal(0, 0.001)
+                cal.observe_flow(cvd, ofi, true_alpha * cvd + true_beta * ofi + noise)
+            params = cal.recalibrate_flow()
+
+        assert params.alpha == pytest.approx(true_alpha, abs=3e-4)
+        assert params.beta == pytest.approx(true_beta, abs=3e-4)
+
+    def test_flow_coefficients_stay_within_sanity_bounds(self):
+        rng = np.random.default_rng(1)
+        cal = CategoricalParameterCalibrator("EVT", CategoricalASParams())
+        for _ in range(400):
+            # wildly out-of-scale relationship, should get clipped, not explode
+            cal.observe_flow(cvd=rng.normal(0, 1), ofi_norm=rng.normal(0, 1),
+                              delta_ln_p_next=rng.normal(0, 1) * 10.0)
+        params = cal.recalibrate_flow()
+        assert -0.01 <= params.alpha <= 0.01
+        assert -0.01 <= params.beta <= 0.01
+
+    def test_k_returns_unchanged_below_min_obs(self):
+        cal = CategoricalParameterCalibrator("EVT", CategoricalASParams(k=1.5))
+        for _ in range(cal.MIN_OBS_FOR_K - 1):
+            cal.observe_fill_outcome(delta=0.01, filled=True)
+        assert cal.calibrate_k_from_fills() == 1.5
+
+    def test_k_naive_log_fit_on_saturated_fills_recovers_garbage(self):
+        """Documents the failure mode the fix addresses: with a fill
+        observation window long enough that lambda*window saturates
+        p_fill near 1 across the whole delta range, taking ln() of the
+        raw fill rate directly (skipping the Poisson inversion) recovers
+        a k an order of magnitude too small. Reproduces it by hand
+        rather than against the real method, which no longer does this."""
+        rng = np.random.default_rng(1)
+        true_k, true_A, dt = 2.2, 1.0, 30.0   # long window -> saturates
+        deltas = rng.uniform(0.0005, 0.05, 3000)
+        lam = true_A * np.exp(-true_k * deltas)
+        p_fill = 1 - np.exp(-lam * dt)
+        filled = rng.uniform(0, 1, len(deltas)) < p_fill
+
+        edges = np.unique(np.quantile(deltas, np.linspace(0, 1, 11)))
+        idx = np.digitize(deltas, edges[1:-1])
+        bd, br = [], []
+        for b in range(len(edges) - 1):
+            mask = idx == b
+            if mask.sum() < 5 or filled[mask].mean() <= 0:
+                continue
+            bd.append(deltas[mask].mean())
+            br.append(filled[mask].mean())
+
+        x = np.array(bd)
+        y_naive = np.log(np.array(br))   # the broken approach: no inversion
+        coef, *_ = np.linalg.lstsq(np.column_stack([np.ones(len(x)), x]), y_naive, rcond=None)
+        naive_k = -coef[1]
+        assert naive_k < true_k / 2   # confirms it's badly wrong, not just noisy
+
+    def test_k_calibration_recovers_true_k_with_unsaturated_window(self):
+        """Same true_k as the saturated case above, short enough
+        fill_obs_window_s that p_fill doesn't saturate, the real method
+        (with the Poisson inversion) should land close to the true k."""
+        rng = np.random.default_rng(1)
+        true_k, true_A, dt = 2.2, 1.0, 1.0
+        cal = CategoricalParameterCalibrator("EVT", CategoricalASParams(k=1.5), fill_obs_window_s=dt)
+
+        for _ in range(5000):
+            delta = rng.uniform(0.0005, 0.05)
+            lam = true_A * math.exp(-true_k * delta)
+            p_fill = 1 - math.exp(-lam * dt)
+            cal.observe_fill_outcome(delta, rng.uniform(0, 1) < p_fill)
+
+        k_est = cal.calibrate_k_from_fills()
+        assert k_est == pytest.approx(true_k, abs=0.3)
+
+    def test_k_ignores_fully_saturated_buckets_instead_of_crashing(self):
+        cal = CategoricalParameterCalibrator("EVT", CategoricalASParams(k=1.5), fill_obs_window_s=30.0)
+        for _ in range(200):
+            cal.observe_fill_outcome(delta=0.01, filled=True)   # always fills, 100% saturated
+        k = cal.calibrate_k_from_fills()
+        assert k == 1.5   # falls back cleanly, doesn't raise on log(1 - 1.0)
+
+    def test_gamma_from_drawdown_matches_formula(self):
+        cal = CategoricalParameterCalibrator("EVT", CategoricalASParams(gamma=0.05))
+        gamma = cal.calibrate_gamma_from_drawdown(max_drawdown_usd=500.0, notional_usd=10_000.0, sigma_p=0.10)
+        expected = 2 * 500.0 / (10_000.0 * 0.10 ** 2)
+        assert gamma == pytest.approx(min(expected, 1.0), abs=1e-9)
+        assert cal.params.gamma == gamma
+
+    def test_gamma_unchanged_when_notional_zero(self):
+        cal = CategoricalParameterCalibrator("EVT", CategoricalASParams(gamma=0.05))
+        gamma = cal.calibrate_gamma_from_drawdown(max_drawdown_usd=500.0, notional_usd=0.0)
+        assert gamma == 0.05
 
 
 # CategoricalSkewEngine
