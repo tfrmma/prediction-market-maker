@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict
 
 import numpy as np
@@ -133,3 +133,166 @@ class CategoricalFairValueEngine:
             should_quote=should_quote,
             is_stale=is_stale,
         )
+
+
+class CategoricalParameterCalibrator:
+    """
+    Online calibration of CategoricalASParams (alpha, beta, k, gamma)
+    for one event. Same three targets as fair_value.py's
+    ParameterCalibrator, pooled across every outcome in the basket
+    since alpha/beta/k/gamma are shared basket-wide, not per-outcome.
+
+    alpha/beta: rolling OLS, but the target is delta_ln(p_i), not raw
+    delta_mid, alpha/beta get applied additively in log-score space
+    here (score_i = ln(p_i) + alpha*cvd_i + beta*ofi_i), not raw
+    probability space, so that's the unit the regression needs to be in.
+
+    k: empirical fill-rate vs. quote-distance histogram, log-linear fit.
+    fair_value.py's ParameterCalibrator docstring promises this
+    ("k: from empirical fill rate vs spread distance histogram") but
+    never actually implements it, only alpha/beta and gamma are real
+    there. This one does.
+
+    gamma: same drawdown-based conversion as the binary calibrator,
+    reused as-is, it's a portfolio risk-tolerance formula, nothing
+    outcome-specific about it.
+    """
+
+    WINDOW = 500
+    MIN_OBS_FOR_OLS = 50
+    MIN_OBS_FOR_K = 50
+    N_DELTA_BUCKETS = 10
+    MIN_BUCKET_OBS = 5
+
+    def __init__(self, event_id: str, base_params: CategoricalASParams, fill_obs_window_s: float = 1.0):
+        self._event_id = event_id
+        self._params = base_params
+        self._fill_obs_window_s = fill_obs_window_s   # see calibrate_k_from_fills
+        self._X: list = []              # [(cvd_i, ofi_i), ...] pooled across outcomes
+        self._y: list = []              # [delta_ln_p_i_next, ...]
+        self._fill_obs: list = []       # [(delta, filled), ...]
+        self._log = logger.bind(component="categorical_calibrator", event_id=event_id)
+
+    def observe_flow(self, cvd: float, ofi_norm: float, delta_ln_p_next: float) -> None:
+        """One (outcome, tick) observation. Call once per outcome per
+        basket update, pooling across outcomes is intentional."""
+        self._X.append((cvd, ofi_norm))
+        self._y.append(delta_ln_p_next)
+        if len(self._X) > self.WINDOW:
+            self._X.pop(0)
+            self._y.pop(0)
+
+    def observe_fill_outcome(self, delta: float, filled: bool) -> None:
+        """delta = |quoted_price - mid| for whichever side was live,
+        filled = whether it got hit within fill_obs_window_s of being
+        posted. Window needs to be roughly constant across observations,
+        calibrate_k_from_fills() assumes a single shared window when it
+        inverts the Poisson relationship."""
+        self._fill_obs.append((delta, filled))
+        if len(self._fill_obs) > self.WINDOW:
+            self._fill_obs.pop(0)
+
+    def recalibrate_flow(self) -> CategoricalASParams:
+        """Re-estimate alpha/beta via OLS. Returns updated params (caller
+        replaces current params)."""
+        if len(self._X) < self.MIN_OBS_FOR_OLS:
+            return self._params
+
+        X = np.array(self._X)
+        y = np.array(self._y)
+        Xb = np.column_stack([np.ones(len(X)), X])
+
+        try:
+            coeffs = np.linalg.lstsq(Xb, y, rcond=None)[0]
+            _, alpha_new, beta_new = coeffs
+
+            # Regularize: don't let coefficients jump wildly tick to tick
+            alpha_new = 0.7 * self._params.alpha + 0.3 * float(alpha_new)
+            beta_new = 0.7 * self._params.beta + 0.3 * float(beta_new)
+            alpha_new = float(np.clip(alpha_new, -0.01, 0.01))
+            beta_new = float(np.clip(beta_new, -0.01, 0.01))
+
+            self._params = replace(self._params, alpha=alpha_new, beta=beta_new)
+            self._log.info(
+                "categorical_flow_params_calibrated",
+                alpha=round(alpha_new, 6), beta=round(beta_new, 6), n_obs=len(self._X),
+            )
+        except np.linalg.LinAlgError as exc:
+            self._log.warning("flow_calibration_failed", error=str(exc))
+
+        return self._params
+
+    def calibrate_k_from_fills(self) -> float:
+        """
+        Bucket (delta, filled) observations by distance-from-mid quantile,
+        empirical fill rate per bucket, invert the Poisson relationship
+        each observation actually came from (fill_rate = 1 - exp(-lambda
+        * fill_obs_window_s)) to recover lambda_hat, then log-linear fit:
+
+            ln(lambda_hat) = ln(A) - k * delta
+
+        Taking ln() of the raw fill rate directly (skipping the
+        inversion) only works while lambda*dt is small, real fill rates
+        saturate toward 1 well before that, and the fit silently
+        recovers a k an order of magnitude too small. Caught this by
+        validating against a simulator with a known true k before
+        trusting the formula, see test_core.py.
+        """
+        if len(self._fill_obs) < self.MIN_OBS_FOR_K:
+            return self._params.k
+
+        deltas = np.array([d for d, _ in self._fill_obs])
+        filled = np.array([1.0 if f else 0.0 for _, f in self._fill_obs])
+
+        edges = np.unique(np.quantile(deltas, np.linspace(0, 1, self.N_DELTA_BUCKETS + 1)))
+        if len(edges) < 3:
+            return self._params.k
+        bucket_idx = np.digitize(deltas, edges[1:-1])
+
+        bucket_delta, bucket_lambda = [], []
+        for b in range(len(edges) - 1):
+            mask = bucket_idx == b
+            if mask.sum() < self.MIN_BUCKET_OBS:
+                continue
+            rate = filled[mask].mean()
+            if rate <= 0 or rate >= 1:
+                continue   # can't invert a 0% or saturated 100% bucket
+            lam_hat = -math.log(1 - rate) / self._fill_obs_window_s
+            bucket_delta.append(float(deltas[mask].mean()))
+            bucket_lambda.append(lam_hat)
+
+        if len(bucket_delta) < 3:
+            return self._params.k
+
+        x = np.array(bucket_delta)
+        y = np.log(np.array(bucket_lambda))
+        Xb = np.column_stack([np.ones(len(x)), x])
+
+        try:
+            _, slope = np.linalg.lstsq(Xb, y, rcond=None)[0]
+            k_new = float(np.clip(-slope, 0.1, 10.0))
+            k_new = 0.7 * self._params.k + 0.3 * k_new
+
+            self._params = replace(self._params, k=k_new)
+            self._log.info("k_calibrated", k=round(k_new, 4), n_buckets=len(bucket_delta))
+            return k_new
+        except np.linalg.LinAlgError as exc:
+            self._log.warning("k_calibration_failed", error=str(exc))
+            return self._params.k
+
+    def calibrate_gamma_from_drawdown(
+        self, max_drawdown_usd: float, notional_usd: float, sigma_p: float = 0.10,
+    ) -> float:
+        """gamma ~= 2*max_drawdown / (notional * sigma_p^2), same CARA
+        risk-tolerance approximation as the binary calibrator."""
+        if notional_usd <= 0 or sigma_p <= 0:
+            return self._params.gamma
+
+        gamma = float(np.clip(2 * max_drawdown_usd / (notional_usd * sigma_p ** 2), 0.001, 1.0))
+        self._params = replace(self._params, gamma=gamma)
+        self._log.info("gamma_calibrated", gamma=round(gamma, 5))
+        return gamma
+
+    @property
+    def params(self) -> CategoricalASParams:
+        return self._params
