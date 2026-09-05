@@ -55,32 +55,55 @@ class CategoricalCovarianceEstimator:
     """One instance per event. Feed it CategoricalMarketState snapshots,
     call covariance(current_p_mid) for an (N-1)x(N-1) probability-space
     matrix, EWMA once warmed up, structural prior otherwise. Reference
-    outcome is fixed at construction (last id in outcome_ids), switching
-    it mid-stream would break the running EWMA's coordinate system.
+    outcome stays fixed between resets (last id in outcome_ids by
+    default, or the highest-probability one if initial_p_mid is given),
+    switching it invalidates the running EWMA's coordinate system, which
+    is why that only ever happens through the explicit
+    maybe_reset_reference() below, never silently.
 
-    TODO: if the reference outcome's own probability collapses toward 0
-    well into the estimator's life, the ALR->probability conversion gets
-    poorly conditioned. Haven't hit this in practice, worth a CLR/ILR
-    basis instead of a fixed reference if it does.
+    Two defenses against the reference (or any outcome) collapsing
+    toward 0 mid-event, which is when the ALR<->probability conversion
+    gets numerically dangerous:
+      - covariance() checks every probability the conversion actually
+        touches against MIN_SAFE_PROB before inverting the Jacobian,
+        falls back to the (always well-behaved) structural prior rather
+        than trust a near-singular inversion.
+      - maybe_reset_reference(), called periodically from outside the
+        hot path, swaps to whichever outcome currently has the highest
+        probability once the current reference drops below
+        MIN_SAFE_PROB, and resets the EWMA, old observations were in
+        the old coordinate system and aren't valid in the new one.
     """
 
     MIN_OBS_FOR_EWMA = 30
+    MIN_SAFE_PROB = 0.02   # below this, for any outcome the ALR machinery touches,
+                            # covariance() distrusts the conversion and
+                            # maybe_reset_reference() will swap the reference out
 
-    def __init__(self, event_id: str, outcome_ids: List[str], correlation_window_s: float = 1800.0):
+    def __init__(
+        self,
+        event_id: str,
+        outcome_ids: List[str],
+        correlation_window_s: float = 1800.0,
+        initial_p_mid: Optional[Dict[str, float]] = None,
+    ):
         if len(outcome_ids) < 2:
             raise ValueError(f"{event_id}: need at least 2 outcomes, got {outcome_ids}")
         self._event_id = event_id
         self._outcome_ids = list(outcome_ids)
-        self._reference_id = outcome_ids[-1]
-        self._non_reference_ids = [oid for oid in self._outcome_ids if oid != self._reference_id]
         self._window_s = correlation_window_s
+        self._log = logger.bind(component="categorical_covariance", event_id=event_id)
+
+        if initial_p_mid:
+            self._reference_id = max(outcome_ids, key=lambda oid: initial_p_mid.get(oid, 0.0))
+        else:
+            self._reference_id = outcome_ids[-1]
+        self._non_reference_ids = [oid for oid in self._outcome_ids if oid != self._reference_id]
 
         self._mean: Optional[np.ndarray] = None
         self._cov: Optional[np.ndarray] = None   # native ALR-space EWMA state
         self._last_ts: Optional[float] = None
         self._n_obs = 0
-
-        self._log = logger.bind(component="categorical_covariance", event_id=event_id)
 
     @property
     def reference_id(self) -> str:
@@ -135,11 +158,65 @@ class CategoricalCovarianceEstimator:
 
     def covariance(self, current_p_mid: Dict[str, float]) -> np.ndarray:
         """Probability-space, safe for the skew formula. EWMA once warmed
-        up (converted via the local Jacobian at current_p_mid), structural
-        prior otherwise."""
+        up and every probability the ALR conversion touches is above
+        MIN_SAFE_PROB (converted via the local Jacobian at
+        current_p_mid), structural prior otherwise, that prior never
+        needs a matrix inversion so it's numerically safe regardless of
+        how skewed current_p_mid is.
+
+        Checked empirically before picking this over a condition-number
+        threshold: the Jacobian's condition number scales with 1/p for
+        whichever outcome (reference or not) is smallest, but it's
+        already capped by the 1e-6 floor inside _alr_jacobian well
+        before a generic condition-number cutoff would ever trigger, a
+        direct probability floor is simpler and actually fires when it
+        should.
+        """
         if self._n_obs >= self.MIN_OBS_FOR_EWMA:
-            jac = self._alr_jacobian(current_p_mid)
-            jac_inv = np.linalg.inv(jac)
-            return jac_inv @ self._cov @ jac_inv.T
+            relevant = [current_p_mid.get(self._reference_id, 0.0)] + [
+                current_p_mid.get(oid, 0.0) for oid in self._non_reference_ids
+            ]
+            min_p = min(relevant)
+            if min_p >= self.MIN_SAFE_PROB:
+                jac = self._alr_jacobian(current_p_mid)
+                jac_inv = np.linalg.inv(jac)
+                return jac_inv @ self._cov @ jac_inv.T
+            self._log.warning(
+                "alr_conversion_unsafe",
+                min_probability=min_p,
+                threshold=self.MIN_SAFE_PROB,
+                reference_id=self._reference_id,
+            )
 
         return structural_probability_covariance(current_p_mid, self._outcome_ids, self._reference_id)
+
+    def maybe_reset_reference(self, current_p_mid: Dict[str, float]) -> bool:
+        """
+        Call periodically (e.g. from a calibration loop), not from the
+        hot path. If the current reference's probability has dropped
+        below MIN_SAFE_PROB, switches to whichever outcome currently has
+        the highest probability and resets the running EWMA, old
+        observations were in the old reference's coordinate system and
+        aren't meaningful in the new one. Returns whether a reset
+        happened.
+        """
+        current_ref_p = current_p_mid.get(self._reference_id, 0.0)
+        if current_ref_p >= self.MIN_SAFE_PROB:
+            return False
+
+        new_reference = max(self._outcome_ids, key=lambda oid: current_p_mid.get(oid, 0.0))
+        if new_reference == self._reference_id:
+            return False   # nothing better available right now, stay put
+
+        self._log.warning(
+            "categorical_covariance_reference_reset",
+            old_reference=self._reference_id, old_reference_p=current_ref_p,
+            new_reference=new_reference, new_reference_p=current_p_mid.get(new_reference),
+        )
+        self._reference_id = new_reference
+        self._non_reference_ids = [oid for oid in self._outcome_ids if oid != self._reference_id]
+        self._mean = None
+        self._cov = None
+        self._last_ts = None
+        self._n_obs = 0
+        return True
