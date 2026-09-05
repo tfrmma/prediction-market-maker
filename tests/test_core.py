@@ -988,6 +988,99 @@ class TestCategoricalCovarianceEstimator:
         assert sigma.shape == cold_prior.shape
         assert est.alr_covariance() is not None
 
+    def _warm_with_variation(self, est, outcome_ids, base_p, ts_offset=0, n=60, seed=2):
+        """Feed n ticks of genuinely varying prices (not a constant, which
+        would leave the EWMA covariance at exactly zero) around base_p."""
+        rng = np.random.default_rng(seed)
+        for i in range(n):
+            noisy = {}
+            remaining = 1.0
+            for j, oid in enumerate(outcome_ids[:-1]):
+                p = float(np.clip(base_p[oid] + rng.normal(0, 0.02), 0.02, 0.9))
+                noisy[oid] = p
+                remaining -= p
+            noisy[outcome_ids[-1]] = max(1e-3, remaining)
+            est.observe(self._basket(noisy, ts=float(ts_offset + i)))
+
+    def test_reference_selection_prefers_highest_probability_with_hint(self):
+        est = CategoricalCovarianceEstimator(
+            "EVT", ["A", "B", "C"], initial_p_mid={"A": 0.1, "B": 0.6, "C": 0.3},
+        )
+        assert est.reference_id == "B"
+
+    def test_covariance_falls_back_to_structural_when_reference_collapses(self):
+        """Reproduces the exact scenario the old TODO worried about: the
+        reference outcome's probability craters mid-event. covariance()
+        should hand back the structural prior, not a numerically
+        poisoned EWMA conversion."""
+        est = CategoricalCovarianceEstimator("EVT", ["A", "B", "C"])  # ref = C
+        self._warm_with_variation(est, ["A", "B", "C"], {"A": 0.40, "B": 0.35})
+        assert est.n_obs >= est.MIN_OBS_FOR_EWMA
+
+        crashed = {"A": 0.55, "B": 0.44, "C": 0.001}
+        sigma = est.covariance(crashed)
+        expected = structural_probability_covariance(crashed, ["A", "B", "C"], "C")
+        assert np.allclose(sigma, expected)
+
+    def test_covariance_falls_back_when_a_non_reference_outcome_collapses(self):
+        """Same danger, different outcome, the reference itself (C) is
+        healthy here, A (not the reference) is the one that craters."""
+        est = CategoricalCovarianceEstimator("EVT", ["A", "B", "C"])  # ref = C
+        self._warm_with_variation(est, ["A", "B", "C"], {"A": 0.40, "B": 0.35})
+
+        crashed = {"A": 0.001, "B": 0.5, "C": 0.499}
+        sigma = est.covariance(crashed)
+        expected = structural_probability_covariance(crashed, ["A", "B", "C"], "C")
+        assert np.allclose(sigma, expected)
+
+    def test_covariance_still_uses_ewma_when_all_probabilities_healthy(self):
+        """The safety fallback shouldn't fire for an ordinary, healthy
+        basket, that would defeat the point of having an EWMA at all."""
+        est = CategoricalCovarianceEstimator("EVT", ["A", "B", "C"])
+        self._warm_with_variation(est, ["A", "B", "C"], {"A": 0.40, "B": 0.35})
+
+        healthy = {"A": 0.42, "B": 0.33, "C": 0.25}
+        sigma = est.covariance(healthy)
+        structural = structural_probability_covariance(healthy, ["A", "B", "C"], "C")
+        assert not np.allclose(sigma, structural)   # actually used the EWMA path
+
+    def test_maybe_reset_reference_switches_and_resets_ewma(self):
+        est = CategoricalCovarianceEstimator("EVT", ["A", "B", "C"])  # ref = C
+        self._warm_with_variation(est, ["A", "B", "C"], {"A": 0.40, "B": 0.35})
+        assert est.n_obs >= est.MIN_OBS_FOR_EWMA
+
+        did_reset = est.maybe_reset_reference({"A": 0.55, "B": 0.44, "C": 0.001})
+        assert did_reset is True
+        assert est.reference_id == "A"   # highest current probability
+        assert est.n_obs == 0
+        assert est.alr_covariance() is None   # EWMA state genuinely cleared
+
+    def test_maybe_reset_reference_noop_when_reference_healthy(self):
+        est = CategoricalCovarianceEstimator("EVT", ["A", "B", "C"])
+        self._warm_with_variation(est, ["A", "B", "C"], {"A": 0.40, "B": 0.35})
+        n_obs_before = est.n_obs
+
+        did_reset = est.maybe_reset_reference({"A": 0.42, "B": 0.33, "C": 0.25})
+        assert did_reset is False
+        assert est.reference_id == "C"
+        assert est.n_obs == n_obs_before   # untouched, no reset
+
+    def test_maybe_reset_reference_noop_when_already_the_best_option(self):
+        """Reference is weak, but still the strongest of the bunch,
+        nothing better to switch to, shouldn't thrash or reset state
+        for no gain."""
+        est = CategoricalCovarianceEstimator("EVT", ["A", "B", "C"])
+        self._warm_with_variation(est, ["A", "B", "C"], {"A": 0.40, "B": 0.35})
+        n_obs_before = est.n_obs
+        est._reference_id = "A"
+        est._non_reference_ids = ["B", "C"]
+
+        # A is below MIN_SAFE_PROB but still the highest of the three
+        did_reset = est.maybe_reset_reference({"A": 0.01, "B": 0.005, "C": 0.005})
+        assert did_reset is False
+        assert est.reference_id == "A"
+        assert est.n_obs == n_obs_before   # state untouched
+
 
 # CategoricalFairValueEngine
 class TestCategoricalFairValueEngine:
