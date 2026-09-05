@@ -706,6 +706,14 @@ class Orchestrator:
                     alpha=round(updated.alpha, 6),
                     beta=round(updated.beta, 6),
                 )
+            for event_id, cov_est in self._categorical_cov.items():
+                group = self._cfg.event_groups[event_id]
+                current_p_mid = {
+                    oid: self._categorical_last_p[oid] for oid in group.outcome_ids
+                    if oid in self._categorical_last_p
+                }
+                if len(current_p_mid) == len(group.outcome_ids):
+                    cov_est.maybe_reset_reference(current_p_mid)
 
     # Kill monitor
     async def _monitor_kill(self) -> None:
